@@ -218,12 +218,7 @@ fn build_model_visible_specs_and_registry(
     specs.extend(hosted_specs);
 
     let registry = ToolRegistry::from_tools(runtimes);
-    let model_visible_specs = merge_into_namespaces(specs)
-        .into_iter()
-        .filter(|spec| {
-            namespace_tools_enabled(turn_context) || !matches!(spec, ToolSpec::Namespace(_))
-        })
-        .collect();
+    let model_visible_specs = adapt_specs_for_provider(turn_context, merge_into_namespaces(specs));
 
     (model_visible_specs, registry)
 }
@@ -284,6 +279,60 @@ pub(crate) fn tool_suggest_enabled(turn_context: &TurnContext) -> bool {
     features.enabled(Feature::ToolSuggest)
         && features.enabled(Feature::Apps)
         && features.enabled(Feature::Plugins)
+}
+
+
+/// Flattens OpenAI-only `ToolSpec::Namespace` entries into individual
+/// `ToolSpec::Function` entries when the active provider cannot pass the
+/// Responses-API namespace tool shape through to the model.
+///
+/// The `type: "namespace"` tool shape (along with `type: "web_search"` and
+/// `type: "image_generation"`) is an OpenAI Responses API extension. Custom
+/// providers that speak the Responses wire format with `wire_api = "responses"`
+/// (e.g. MiniMax at `https://api.minimax.io/v1/responses`) silently drop these
+/// shapes from the request before the model sees them, so MCP servers exposed
+/// as namespaces become invisible. Flattening the namespace into its contained
+/// `ResponsesApiTool` entries (which serialize as `type: "function"`, the only
+/// tool shape every Responses-API provider forwards) restores the tools.
+fn adapt_specs_for_provider(turn_context: &TurnContext, specs: Vec<ToolSpec>) -> Vec<ToolSpec> {
+    // Provider check first: if the active provider is *not* OpenAI or Amazon
+    // Bedrock, it speaks the Responses wire format but does not pass through
+    // the OpenAI-only `type: "namespace"` tool shape, so flatten namespaces
+    // into individual `type: "function"` entries regardless of the
+    // `namespace_tools` capability flag. (The capability default is `true`
+    // for unknown providers, which would otherwise mask this case.)
+    let flatten_for_custom_provider = turn_context
+        .provider
+        .info()
+        .is_openai_or_amazon_bedrock()
+        .is_none();
+    if !flatten_for_custom_provider {
+        return specs;
+    }
+    // Capability check second: even on a custom provider, a future
+    // `namespace_tools = false` config flag should still be honoured as an
+    // explicit opt-out (in which case the namespace tools are dropped
+    // entirely).
+    if !namespace_tools_enabled(turn_context) {
+        return specs
+            .into_iter()
+            .filter(|spec| !matches!(spec, ToolSpec::Namespace(_)))
+            .collect();
+    }
+    let mut out = Vec::with_capacity(specs.len());
+    for spec in specs {
+        match spec {
+            ToolSpec::Namespace(namespace) => {
+                for tool in namespace.tools {
+                    if let ResponsesApiNamespaceTool::Function(function) = tool {
+                        out.push(ToolSpec::Function(function));
+                    }
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 fn namespace_tools_enabled(turn_context: &TurnContext) -> bool {

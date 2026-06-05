@@ -391,6 +391,20 @@ impl ModelProviderInfo {
         self.name == AMAZON_BEDROCK_PROVIDER_NAME
     }
 
+    /// Returns `Some(())` when the provider is one of the providers known to
+    /// correctly forward the OpenAI Responses API tool shapes (`namespace`,
+    /// `web_search`, `image_generation`) — currently OpenAI and Amazon Bedrock.
+    /// Returns `None` for every other provider, indicating that callers should
+    /// fall back to wire shapes that are universally forwarded
+    /// (`type: "function"` for tools).
+    pub fn is_openai_or_amazon_bedrock(&self) -> Option<()> {
+        if self.is_openai() || self.is_amazon_bedrock() {
+            Some(())
+        } else {
+            None
+        }
+    }
+
     pub fn supports_remote_compaction(&self) -> bool {
         self.is_openai() || is_azure_responses_provider(&self.name, self.base_url.as_deref())
     }
