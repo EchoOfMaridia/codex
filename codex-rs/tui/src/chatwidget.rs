@@ -2011,6 +2011,42 @@ const SIDE_PLACEHOLDERS: [&str; 3] = [
     "Will this algorithm scale well?",
 ];
 
+/// Build a fallback header from the first non-empty line of a reasoning
+/// buffer when no `**bold**` marker is present. The text is truncated to a
+/// width that fits the status header; whitespace is collapsed. Returns
+/// `None` if the buffer is empty or the candidate line would be too short
+/// or too long to be useful as a header.
+fn fallback_reasoning_header(s: &str) -> Option<String> {
+    const MAX_HEADER_CHARS: usize = 60;
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for ch in trimmed.chars() {
+        if ch == '\n' || ch == '\r' {
+            break;
+        }
+        if ch.is_whitespace() {
+            if out.ends_with(' ') {
+                continue;
+            }
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+        if out.len() >= MAX_HEADER_CHARS {
+            break;
+        }
+    }
+    let out = out.trim().to_string();
+    if out.len() < 3 {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 // Extract the first bold (Markdown) element in the form **...** from `s`.
 // Returns the inner text if found; otherwise `None`.
 fn extract_first_bold(s: &str) -> Option<String> {

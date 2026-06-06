@@ -202,12 +202,17 @@ impl ChatWidget {
             return;
         }
 
-        if let Some(header) = extract_first_bold(&self.reasoning_buffer) {
-            // Update the shimmer header to the extracted reasoning chunk header.
+        // Prefer a **bold** heading (the canonical Codex reasoning convention).
+        // Fall back to the first line of the buffer so the status header
+        // updates even on models (e.g. MiniMax M3) whose reasoning does not
+        // use markdown bold, and to a generic "Thinking..." label if we have
+        // not yet received any usable text. Without this fallback the header
+        // would stay at "Working" for the entire reasoning block.
+        let header = extract_first_bold(&self.reasoning_buffer)
+            .or_else(|| fallback_reasoning_header(&self.reasoning_buffer));
+        if let Some(header) = header {
             self.status_state.terminal_title_status_kind = TerminalTitleStatusKind::Thinking;
             self.set_status_header(header);
-        } else {
-            // Fallback while we don't yet have a bold header: leave existing header as-is.
         }
         self.request_redraw();
     }

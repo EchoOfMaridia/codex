@@ -102,7 +102,23 @@ impl ToolRouter {
                 call_id,
                 ..
             } => {
-                let tool_name = ToolName::new(namespace, name);
+                // When the active provider cannot forward the Responses-API
+                // `type: "namespace"` tool shape, Codex flattens every MCP
+                // namespace into individual `type: "function"` tools whose
+                // wire `name` is `<namespace>__<tool>` (see
+                // `spec_plan::adapt_specs_for_provider`). Recover the original
+                // `ToolName` from the wire name when the model emits a
+                // function call whose `namespace` field is empty, so the
+                // dispatcher can find the locally registered McpHandler.
+                // The `namespace`-field path is preserved for OpenAI /
+                // Amazon Bedrock, which pass the namespace through
+                // out-of-band on the function call.
+                let tool_name = if namespace.is_none() {
+                    crate::tools::split_responses_tool_name(&name)
+                        .unwrap_or_else(|| ToolName::new(namespace, name))
+                } else {
+                    ToolName::new(namespace, name)
+                };
                 Ok(Some(ToolCall {
                     tool_name,
                     call_id,

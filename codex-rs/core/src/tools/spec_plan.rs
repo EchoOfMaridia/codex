@@ -50,6 +50,7 @@ use crate::tools::handlers::view_image_spec::ViewImageToolOptions;
 use crate::tools::hosted_spec::WebSearchToolOptions;
 use crate::tools::hosted_spec::create_image_generation_tool;
 use crate::tools::hosted_spec::create_web_search_tool;
+use crate::tools::join_responses_tool_name;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExposure;
 use crate::tools::registry::ToolRegistry;
@@ -323,10 +324,28 @@ fn adapt_specs_for_provider(turn_context: &TurnContext, specs: Vec<ToolSpec>) ->
     for spec in specs {
         match spec {
             ToolSpec::Namespace(namespace) => {
+                // Flatten each namespace into the contained function tool
+                // definitions, but rename the wire `name` to encode the
+                // namespace prefix (e.g. `web_search` from the `mcp__minimax`
+                // namespace becomes `mcp__minimax__web_search`). Without the
+                // prefix the round-trip would fail: the model would call the
+                // tool as `web_search`, Codex would not be able to find a
+                // matching local handler, and the dispatch would return
+                // `unsupported call: web_search`. The inverse split is
+                // applied in `router::build_tool_call` for this provider
+                // class, so the namespace is recovered before lookup.
+                let namespace_prefix = namespace.name;
                 for tool in namespace.tools {
-                    if let ResponsesApiNamespaceTool::Function(function) = tool {
-                        out.push(ToolSpec::Function(function));
-                    }
+                    // The `ResponsesApiNamespaceTool` enum currently has a
+                    // single `Function` variant, but match explicitly so
+                    // future variants (e.g. hosted-search) gracefully no-op
+                    // rather than panic on the default.
+                    let ResponsesApiNamespaceTool::Function(mut function) = tool;
+                    function.name = join_responses_tool_name(&ToolName::namespaced(
+                        namespace_prefix.clone(),
+                        function.name,
+                    ));
+                    out.push(ToolSpec::Function(function));
                 }
             }
             other => out.push(other),
