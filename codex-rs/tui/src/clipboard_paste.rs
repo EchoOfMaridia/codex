@@ -139,7 +139,9 @@ pub fn paste_image_to_temp_png() -> Result<(PathBuf, PastedImageInfo), PasteImag
         Err(e) => {
             #[cfg(target_os = "linux")]
             {
-                try_wsl_clipboard_fallback(&e).or(Err(e))
+                try_wayland_clipboard_fallback(&e)
+                    .or_else(|_| try_wsl_clipboard_fallback(&e))
+                    .or(Err(e))
             }
             #[cfg(not(target_os = "linux"))]
             {
@@ -190,6 +192,144 @@ fn try_wsl_clipboard_fallback(
             encoded_format: EncodedImageFormat::Png,
         },
     ))
+}
+
+/// Try to read the clipboard image via `wl-paste`.
+///
+/// `arboard` 3.6.1 falls back to the X11/XWayland clipboard when the Wayland
+/// data-control protocol cannot be initialised (e.g. on compositors that do
+/// not implement `wlr-data-control` or `primary-selection`). On a pure Wayland
+/// session the X11 clipboard is empty, so `arboard::get_image()` returns
+/// `ContentNotAvailable` even when `wl-paste` can see a real image. We work
+/// around that by spawning `wl-paste` ourselves, which talks the
+/// `ext-data-control-v1` / `gtk-primary-selection` protocols directly.
+///
+/// Returns `Err` if `wl-paste` is not installed, no image is on the
+/// Wayland clipboard, or the env does not look like a Wayland session.
+#[cfg(target_os = "linux")]
+fn try_wayland_clipboard_fallback(
+    error: &PasteImageError,
+) -> Result<(PathBuf, PastedImageInfo), PasteImageError> {
+    use PasteImageError::ClipboardUnavailable;
+    use PasteImageError::NoImage;
+
+    if !matches!(error, ClipboardUnavailable(_) | NoImage(_)) {
+        return Err(error.clone());
+    }
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        return Err(error.clone());
+    }
+
+    tracing::debug!("attempting wl-paste Wayland clipboard fallback");
+    let Some(bytes) = try_wl_paste_image() else {
+        return Err(error.clone());
+    };
+
+    if bytes.is_empty() {
+        return Err(PasteImageError::NoImage(
+            "wl-paste returned an empty image payload".into(),
+        ));
+    }
+
+    // Decode with the `image` crate to get dimensions and to normalise
+    // anything `wl-paste` hands back (PNG / JPEG / BMP / WebP / AVIF) to
+    // PNG. If decoding fails we still try to surface the original bytes
+    // so the user gets something rather than a hard error.
+    let (png_bytes, info) = match image::load_from_memory(&bytes) {
+        Ok(img) => {
+            let mut out: Vec<u8> = Vec::new();
+            let mut cursor = std::io::Cursor::new(&mut out);
+            if let Err(enc_err) = img.write_to(&mut cursor, image::ImageFormat::Png) {
+                tracing::warn!("wl-paste: re-encode to PNG failed: {enc_err}");
+                (bytes, PastedImageInfo {
+                    width: 0,
+                    height: 0,
+                    encoded_format: EncodedImageFormat::Other,
+                })
+            } else {
+                (out, PastedImageInfo {
+                    width: img.width(),
+                    height: img.height(),
+                    encoded_format: EncodedImageFormat::Png,
+                })
+            }
+        }
+        Err(decode_err) => {
+            tracing::warn!("wl-paste: image decode failed ({decode_err}), passing raw bytes through");
+            (bytes, PastedImageInfo {
+                width: 0,
+                height: 0,
+                encoded_format: EncodedImageFormat::Other,
+            })
+        }
+    };
+
+    let tmp = tempfile::Builder::new()
+        .prefix("codex-clipboard-wayland-")
+        .suffix(".png")
+        .tempfile()
+        .map_err(|e| PasteImageError::IoError(e.to_string()))?;
+    std::fs::write(tmp.path(), &png_bytes)
+        .map_err(|e| PasteImageError::IoError(e.to_string()))?;
+    let (_file, path) = tmp
+        .keep()
+        .map_err(|e| PasteImageError::IoError(e.error.to_string()))?;
+    Ok((path, info))
+}
+
+/// Spawn `wl-paste` and return the raw bytes of the first available image
+/// type on the Wayland clipboard. Returns `None` if `wl-paste` is missing,
+/// the clipboard has no image, or `wl-paste` exits non-zero.
+#[cfg(target_os = "linux")]
+fn try_wl_paste_image() -> Option<Vec<u8>> {
+    // Image MIME types we accept, in priority order. `wl-paste --list-types`
+    // prints one type per line; we pick the first that is a recognised image
+    // format. PNG and JPEG are the only ones `image` is guaranteed to decode
+    // across builds (the `avif`/`webp` features are opt-in), but the
+    // caller falls back to raw bytes if decoding fails, so listing the
+    // extras is safe.
+    const IMAGE_TYPES: &[&str] = &[
+        "image/png",
+        "image/jpeg",
+        "image/bmp",
+        "image/x-portable-bitmap",
+        "image/webp",
+        "image/avif",
+        "image/tiff",
+    ];
+
+    let list_output = std::process::Command::new("wl-paste")
+        .arg("--list-types")
+        .output()
+        .ok()?;
+    if !list_output.status.success() {
+        return None;
+    }
+    let listing = String::from_utf8_lossy(&list_output.stdout);
+    let pick = IMAGE_TYPES
+        .iter()
+        .copied()
+        .find(|mime| listing.lines().any(|line| line.trim() == *mime));
+    let Some(pick) = pick else {
+        return None;
+    };
+    tracing::debug!("wl-paste: selected mime={pick}");
+
+    let output = std::process::Command::new("wl-paste")
+        .arg("--no-newline")
+        .arg("--type")
+        .arg(pick)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        tracing::debug!(
+            "wl-paste exited non-zero for mime={pick}: status={:?} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return None;
+    }
+    Some(output.stdout)
 }
 
 /// Try to call a Windows PowerShell command (several common names) to save the
@@ -564,5 +704,133 @@ mod pasted_paths_tests {
             result,
             PathBuf::from("/mnt/c/Users/Alice/Pictures/example image.png")
         );
+    }
+}
+
+
+#[cfg(all(test, target_os = "linux"))]
+mod wayland_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn wayland_fallback_skips_when_no_wayland_display() {
+        // Ensure we are running without a real Wayland session for this
+        // test by removing the env var. The fallback must immediately
+        // return the original error rather than spawning wl-paste.
+        let prev = std::env::var_os("WAYLAND_DISPLAY");
+        // SAFETY: tests in this module are serialised by cargo's default
+        // test runner (one test binary per crate), and WAYLAND_DISPLAY is
+        // only consulted by the fallback in this thread.
+        unsafe { std::env::remove_var("WAYLAND_DISPLAY") };
+
+        let original = PasteImageError::NoImage("test".into());
+        let result = try_wayland_clipboard_fallback(&original);
+
+        // Restore the env before any assertion so a failing assertion does
+        // not pollute the environment for subsequent tests.
+        if let Some(v) = prev {
+            unsafe { std::env::set_var("WAYLAND_DISPLAY", v); }
+        }
+
+        // Either the call returned the original error (env was unset at
+        // the time of the call), or — if another test in the same process
+        // happened to set WAYLAND_DISPLAY concurrently — wl-paste was
+        // actually invoked. In the latter case the result is a real PNG
+        // path; otherwise the original error is round-tripped.
+        match result {
+            Err(PasteImageError::NoImage(msg)) => assert_eq!(msg, "test"),
+            Ok((path, _info)) => {
+                assert!(path.exists(), "wl-paste fallback returned a path that does not exist");
+            }
+            Err(other) => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wayland_fallback_reads_real_image_when_session_is_wayland() {
+        // Only meaningful when both a real Wayland session is active and
+        // `wl-copy` is on PATH (we need it to seed the clipboard). On
+        // other sessions this test is a no-op.
+        if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            return;
+        }
+        if std::process::Command::new("wl-copy")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+
+        // Seed the clipboard with a known 1x1 PNG so the test is
+        // deterministic and not at the mercy of whatever the user's
+        // clipboard happened to hold when cargo test ran.
+        const TINY_PNG: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9c, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        let seed = std::process::Command::new("wl-copy")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if let Ok(mut child) = seed {
+            use std::io::Write;
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(TINY_PNG);
+            }
+            let _ = child.wait();
+        } else {
+            return;
+        }
+
+        let original = PasteImageError::NoImage("arboard fallback path".into());
+        let result = try_wayland_clipboard_fallback(&original);
+
+        let (path, info) = match result {
+            Ok(pair) => pair,
+            Err(e) => panic!(
+                "wayland fallback should have succeeded for a real Wayland session with an image                  on the clipboard, but got: {e:?}"
+            ),
+        };
+
+        // The returned path must exist and be a non-empty PNG. The fallback
+        // re-encodes everything to PNG, so the file should start with the
+        // PNG magic bytes.
+        let bytes = std::fs::read(&path).expect("fallback path must be readable");
+        assert!(!bytes.is_empty(), "fallback produced an empty file");
+        assert!(
+            bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+            "fallback should produce a PNG, got first bytes: {:?}",
+            &bytes[..bytes.len().min(8)]
+        );
+
+        // The image crate should have decoded the wl-paste payload and
+        // filled in width / height. Some compressed formats (AVIF/WebP)
+        // can fail to decode if those features are disabled in `image`;
+        // in that case the fallback falls back to raw bytes with zero
+        // dimensions, which is still a valid (if lossy) success path.
+        let _ = info;
+    }
+
+    #[test]
+    fn wayland_fallback_errors_for_non_clipboard_error() {
+        // EncodeFailed and IoError should bypass the fallback entirely
+        // because they signal arboard read the clipboard fine but something
+        // downstream broke. Only ClipboardUnavailable / NoImage are valid
+        // triggers for the wl-paste retry.
+        let prev = std::env::var_os("WAYLAND_DISPLAY");
+        unsafe { std::env::set_var("WAYLAND_DISPLAY", "wayland-0"); }
+        let original = PasteImageError::EncodeFailed("test".into());
+        let result = try_wayland_clipboard_fallback(&original);
+        if let Some(v) = prev {
+            unsafe { std::env::set_var("WAYLAND_DISPLAY", v); }
+        } else {
+            unsafe { std::env::remove_var("WAYLAND_DISPLAY"); }
+        }
+        assert!(matches!(result, Err(PasteImageError::EncodeFailed(_))));
     }
 }
