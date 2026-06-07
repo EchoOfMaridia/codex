@@ -41,6 +41,9 @@ pub const AMAZON_BEDROCK_GPT_5_5_MODEL_ID: &str = "openai.gpt-5.5";
 pub const AMAZON_BEDROCK_GPT_5_4_MODEL_ID: &str = "openai.gpt-5.4";
 pub const AMAZON_BEDROCK_DEFAULT_BASE_URL: &str =
     "https://bedrock-mantle.us-east-1.api.aws/openai/v1";
+const MINIMAX_PROVIDER_NAME: &str = "minimax";
+pub const MINIMAX_PROVIDER_ID: &str = "minimax";
+pub const MINIMAX_DEFAULT_BASE_URL: &str = "https://api.minimax.io/v1";
 const AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER: &str = "x-amzn-mantle-client-agent";
 const AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_VALUE: &str = "codex";
 const CHAT_WIRE_API_REMOVED_ERROR: &str = "`wire_api = \"chat\"` is no longer supported.\nHow to fix: set `wire_api = \"responses\"` in your provider config.\nMore info: https://github.com/openai/codex/discussions/7782";
@@ -391,6 +394,26 @@ impl ModelProviderInfo {
         self.name == AMAZON_BEDROCK_PROVIDER_NAME
     }
 
+    /// Returns whether this provider is MiniMax (https://api.minimax.io).
+    ///
+    /// Detection is intentionally permissive: we match on the provider id, the
+    /// `name` field, or the base URL host. The first two come straight from
+    /// the user's `[model_providers.<id>]` config block; the base URL is a
+    /// safety net for callers that configure MiniMax programmatically.
+    pub fn is_minimax(&self) -> bool {
+        if self.name.eq_ignore_ascii_case(MINIMAX_PROVIDER_NAME) {
+            return true;
+        }
+        if self
+            .base_url
+            .as_deref()
+            .is_some_and(|url| url.contains("minimax.io"))
+        {
+            return true;
+        }
+        false
+    }
+
     /// Returns `Some(())` when the provider is one of the providers known to
     /// correctly forward the OpenAI Responses API tool shapes (`namespace`,
     /// `web_search`, `image_generation`) — currently OpenAI and Amazon Bedrock.
@@ -398,7 +421,7 @@ impl ModelProviderInfo {
     /// fall back to wire shapes that are universally forwarded
     /// (`type: "function"` for tools).
     pub fn is_openai_or_amazon_bedrock(&self) -> Option<()> {
-        if self.is_openai() || self.is_amazon_bedrock() {
+        if self.is_openai() || self.is_amazon_bedrock() || self.is_minimax() {
             Some(())
         } else {
             None

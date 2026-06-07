@@ -16,6 +16,7 @@ use codex_protocol::openai_models::ModelsResponse;
 use crate::amazon_bedrock::AmazonBedrockModelProvider;
 use crate::auth::auth_manager_for_provider;
 use crate::auth::resolve_provider_auth;
+use crate::minimax_provider::MinimaxModelProvider;
 use crate::models_endpoint::OpenAiModelsEndpoint;
 
 /// Optional provider-backed features that Codex may expose at runtime.
@@ -151,6 +152,8 @@ pub fn create_model_provider(
 ) -> SharedModelProvider {
     if provider_info.is_amazon_bedrock() {
         Arc::new(AmazonBedrockModelProvider::new(provider_info))
+    } else if provider_info.is_minimax() {
+        Arc::new(MinimaxModelProvider::new(provider_info, auth_manager))
     } else {
         Arc::new(ConfiguredModelProvider::new(provider_info, auth_manager))
     }
@@ -417,6 +420,39 @@ mod tests {
         );
 
         assert!(provider.auth_manager().is_none());
+    }
+
+    #[test]
+    fn create_model_provider_routes_minimax_to_minimax_provider() {
+        // Any provider whose `name` or base URL is MiniMax must be dispatched
+        // to `MinimaxModelProvider` so the bundled MiniMax static catalog
+        // (M3 + image modality) is used as the default. Without this branch
+        // the active model would resolve to a generic `ConfiguredModelProvider`
+        // and the TUI would emit the bogus "does not support image inputs"
+        // warning even when the user is on `MiniMax-M3`.
+        let mut info = ModelProviderInfo::default();
+        info.name = "minimax".to_string();
+        info.base_url = Some("https://api.minimax.io/v1".to_string());
+
+        let provider = create_model_provider(info, /*auth_manager*/ None);
+
+        // The dispatch does not expose a public `is_minimax_provider` check, so
+        // we exercise the observable side effect: the default catalog exposed
+        // by the provider's models_manager must include `MiniMax-M3` with
+        // `Image` input modality.
+        let manager = provider.models_manager(test_codex_home(), /*config_model_catalog*/ None);
+        let catalog = manager
+            .try_list_models()
+            .expect("minimax provider should expose a non-empty model list");
+        let m3 = catalog
+            .iter()
+            .find(|preset| preset.model == "MiniMax-M3")
+            .expect("MiniMax static catalog should include MiniMax-M3");
+        assert!(
+            m3.input_modalities
+                .contains(&codex_protocol::openai_models::InputModality::Image),
+            "MiniMax-M3 must declare Image input modality (regression guard for the              \"does not support image inputs\" bug)"
+        );
     }
 
     #[test]
