@@ -1381,3 +1381,109 @@ async fn hosted_tools_follow_provider_auth_model_and_config_gates() {
     .await;
     unsupported_provider.assert_visible_lacks(&["web_search"]);
 }
+
+// === MCP namespace regression for MiniMax ==============================
+// End-to-end regression guard: MiniMax (https://api.minimax.io) does not
+// forward the OpenAI Responses `type: "namespace"` tool shape, so the
+// spec_plan must flatten MCP namespaces into individual function tools
+// (with `<namespace>__<name>` wire names) for the model to see them.
+// This catches a regression introduced by adf3231 which added MiniMax
+// to the "forwards namespace tool shape" set, causing MCP servers to
+// disappear from the model-visible tool schema.
+
+fn minimax_provider() -> ModelProviderInfo {
+    let toml = r#"
+name = "MiniMax"
+base_url = "https://api.minimax.io/v1"
+wire_api = "responses"
+        "#;
+    toml::from_str(toml).unwrap()
+}
+
+fn use_minimax_provider(turn: &mut TurnContext) {
+    let provider_info = minimax_provider();
+    update_config(turn, |config| {
+        config.model_provider_id = "minimax".to_string();
+        config.model_provider = provider_info.clone();
+    });
+    turn.provider = create_model_provider(provider_info, turn.auth_manager.clone());
+}
+
+#[tokio::test]
+async fn minimax_provider_flattens_mcp_namespaces_into_function_tools() {
+    // Configure a turn with the MiniMax provider and a single MCP namespace
+    // containing a web_search function tool. The expected behavior is:
+    //   * the wire model-visible spec contains a `ToolSpec::Function` named
+    //     "mcp__minimax__web_search" (the namespace is encoded in the name)
+    //   * there is NO `ToolSpec::Namespace` entry in the visible spec
+    //     (because it has been flattened)
+    //   * the local handler is still registered under the original
+    //     `mcp__minimax::web_search` ToolName for dispatch round-trip
+    let probe = probe_with(
+        |turn| {
+            use_minimax_provider(turn);
+        },
+        ToolPlanInputs {
+            mcp_tools: Some(vec![mcp_tool(
+                "minimax",
+                "mcp__minimax",
+                "web_search",
+            )]),
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    // The function tool with the wire name encoding the namespace must be visible.
+    probe.assert_visible_contains(&["mcp__minimax__web_search"]);
+
+    // Crucially, the namespace entry itself must NOT be in the visible spec.
+    // If `is_openai_or_amazon_bedrock()` were (wrongly) returning Some(())
+    // for MiniMax, the namespace would survive as `ToolSpec::Namespace` and
+    // the MiniMax API would silently drop it from the request.
+    probe.assert_visible_lacks(&["mcp__minimax"]);
+
+    // The local handler is still registered under the original namespaced
+    // ToolName so the round-trip decoder in router.rs can dispatch calls.
+    // (ToolName's Display impl concatenates namespace+name with no separator,
+    // so the local string is `mcp__minimaxweb_search`; the wire name above
+    // is what actually goes out to the API.)
+    probe.assert_registered_contains(&[&ToolName::namespaced(
+        "mcp__minimax",
+        "web_search",
+    )
+    .to_string()]);
+}
+
+#[tokio::test]
+async fn bedrock_provider_keeps_namespace_shape_unchanged() {
+    // Companion test: confirm the helper still allows the original
+    // namespace passthrough for Amazon Bedrock (which DOES forward
+    // the namespace tool shape). If `is_openai_or_amazon_bedrock()`
+    // were to flip and start flattening for Bedrock, this would
+    // regress.
+    let probe = probe_with(
+        |turn| {
+            turn.model_info.supports_search_tool = true;
+            use_bedrock_provider(turn);
+        },
+        ToolPlanInputs {
+            deferred_mcp_tools: Some(vec![mcp_tool(
+                "searchable",
+                "mcp__searchable",
+                "lookup",
+            )]),
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    // Bedrock should keep the namespace shape so the API can pass it
+    // through. tool_search is exposed (which surfaces nested tools).
+    probe.assert_visible_contains(&["tool_search"]);
+    // And the original namespaced name is still locally registered.
+    probe.assert_registered_contains(&[
+        "tool_search",
+        &ToolName::namespaced("mcp__searchable", "lookup").to_string(),
+    ]);
+}

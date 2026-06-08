@@ -421,7 +421,7 @@ impl ModelProviderInfo {
     /// fall back to wire shapes that are universally forwarded
     /// (`type: "function"` for tools).
     pub fn is_openai_or_amazon_bedrock(&self) -> Option<()> {
-        if self.is_openai() || self.is_amazon_bedrock() || self.is_minimax() {
+        if self.is_openai() || self.is_amazon_bedrock() {
             Some(())
         } else {
             None

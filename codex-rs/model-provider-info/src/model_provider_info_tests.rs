@@ -456,3 +456,93 @@ refresh_interval_ms = 0
     assert_eq!(auth.refresh_interval_ms, 0);
     assert_eq!(auth.refresh_interval(), None);
 }
+
+fn minimax_provider() -> ModelProviderInfo {
+    let toml = r#"
+name = "MiniMax"
+base_url = "https://api.minimax.io/v1"
+wire_api = "responses"
+        "#;
+    toml::from_str(toml).unwrap()
+}
+
+fn openai_provider() -> ModelProviderInfo {
+    ModelProviderInfo::create_openai_provider(/*base_url*/ None)
+}
+
+fn ollama_provider() -> ModelProviderInfo {
+    let toml = r#"
+name = "Ollama"
+base_url = "http://localhost:11434/v1"
+        "#;
+    toml::from_str(toml).unwrap()
+}
+
+// Regression guard: MiniMax (https://api.minimax.io) does NOT forward the
+// OpenAI Responses API `type: "namespace"` tool shape. It must be excluded
+// from `is_openai_or_amazon_bedrock()` so the namespace-flatten path in
+// `adapt_specs_for_provider` actually runs and MCP servers remain visible
+// to the model. Adding `is_minimax()` here was the bug introduced by
+// adf3231 and re-introduced the original 744eedf regression for MiniMax.
+#[test]
+fn minimax_is_not_in_openai_or_amazon_bedrock_set() {
+    let provider = minimax_provider();
+    assert!(
+        provider.is_minimax(),
+        "is_minimax() should detect the MiniMax config block"
+    );
+    assert!(
+        provider.is_openai_or_amazon_bedrock().is_none(),
+        "MiniMax must NOT be in the 'forwards namespace tool shape' set; \
+         see commit 744eedf — MiniMax at api.minimax.io/v1/responses \
+         silently drops `type: \"namespace\"` from the request"
+    );
+}
+
+#[test]
+fn minimax_detected_by_name_and_by_base_url_safety_net() {
+    let by_name = minimax_provider();
+    assert!(by_name.is_minimax());
+
+    let by_base_url_only = ModelProviderInfo {
+        name: "Custom Alias".into(),
+        base_url: Some("https://api.minimax.io/v1".into()),
+        ..minimax_provider()
+    };
+    assert!(
+        by_base_url_only.is_minimax(),
+        "is_minimax() should fall back to base_url detection when name is not 'minimax'"
+    );
+}
+
+#[test]
+fn openai_and_bedrock_still_in_openai_or_amazon_bedrock_set() {
+    // OpenAI detection: existing helper, should still be Some(()).
+    let openai = openai_provider();
+    assert!(openai.is_openai());
+    assert!(openai.is_openai_or_amazon_bedrock().is_some());
+
+    // Amazon Bedrock detection: this is the wire_api=responses provider from
+    // the existing helper. We don't need to deserialize a full Bedrock TOML
+    // here — the contract is that Bedrock stays in the set. Construct one
+    // with the bedrock name and verify the predicate.
+    let bedrock = ModelProviderInfo {
+        name: AMAZON_BEDROCK_PROVIDER_NAME.into(),
+        ..minimax_provider()
+    };
+    assert!(bedrock.is_amazon_bedrock());
+    assert!(bedrock.is_openai_or_amazon_bedrock().is_some());
+}
+
+#[test]
+fn unknown_provider_falls_through_to_flatten_path() {
+    let ollama = ollama_provider();
+    assert!(!ollama.is_openai());
+    assert!(!ollama.is_amazon_bedrock());
+    assert!(!ollama.is_minimax());
+    assert!(
+        ollama.is_openai_or_amazon_bedrock().is_none(),
+        "Unknown providers (Ollama, etc.) must be treated as 'does not forward \
+         namespace tool shape' so the flatten path runs for them too"
+    );
+}
