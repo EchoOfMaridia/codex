@@ -105,11 +105,28 @@ pub(crate) fn normalize_codex_apps_callable_name(
 
     let tool_name = sanitize_name(tool_name);
 
+    // Strip the connector prefix INCLUDING the trailing `_` separator.
+    //
+    // The previous implementation stripped only the connector name itself
+    // (e.g. `github`), which left a leading underscore on the result
+    // (e.g. `_get_user_login` for the GitHub connector's `get_user_login`
+    // tool). That locally-registered name never matched the wire form
+    // round-tripped through `join_responses_tool_name` /
+    // `split_responses_tool_name`, because the wire path uses
+    // `trim_start_matches('_')` on the name component. The dispatcher then
+    // reported `unsupported call: mcp__codex_apps__githubget_user_login`
+    // (no underscore between the connector and the tool name).
+    //
+    // The tool name returned here is the locally-registered `ToolName`
+    // name component for the connector, and it must match the
+    // round-tripped name byte-for-byte. Stripping the connector plus its
+    // `_` separator gives the unprefixed tool name (e.g. `get_user_login`)
+    // and the round-trip becomes symmetric.
     if let Some(connector_name) = connector_name
         .map(str::trim)
         .map(sanitize_name)
         .filter(|name| !name.is_empty())
-        && let Some(stripped) = tool_name.strip_prefix(&connector_name)
+        && let Some(stripped) = tool_name.strip_prefix(&format!("{connector_name}_"))
         && !stripped.is_empty()
     {
         return stripped.to_string();
@@ -119,7 +136,7 @@ pub(crate) fn normalize_codex_apps_callable_name(
         .map(str::trim)
         .map(sanitize_name)
         .filter(|name| !name.is_empty())
-        && let Some(stripped) = tool_name.strip_prefix(&connector_id)
+        && let Some(stripped) = tool_name.strip_prefix(&format!("{connector_id}_"))
         && !stripped.is_empty()
     {
         return stripped.to_string();
@@ -313,4 +330,98 @@ fn sha1_hex(s: &str) -> String {
     hasher.update(s.as_bytes());
     let sha1 = hasher.finalize();
     format!("{sha1:x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
+
+    #[test]
+    fn normalize_strips_connector_name_with_underscore_separator() {
+        let result = normalize_codex_apps_callable_name(
+            CODEX_APPS_MCP_SERVER_NAME,
+            "github_get_user_login",
+            Some("github"),
+            Some("GitHub"),
+        );
+        assert_eq!(result, "get_user_login");
+    }
+
+    #[test]
+    fn normalize_falls_back_to_connector_id_when_name_does_not_match() {
+        let result = normalize_codex_apps_callable_name(
+            CODEX_APPS_MCP_SERVER_NAME,
+            "github_list_repositories",
+            Some("github"),
+            Some("NotTheRightPrefix"),
+        );
+        assert_eq!(result, "list_repositories");
+    }
+
+    #[test]
+    fn normalize_returns_unmodified_name_when_no_prefix_matches() {
+        let result = normalize_codex_apps_callable_name(
+            CODEX_APPS_MCP_SERVER_NAME,
+            "user_login",
+            Some("github"),
+            Some("GitHub"),
+        );
+        assert_eq!(result, "user_login");
+    }
+
+    #[test]
+    fn normalize_returns_unmodified_name_when_connector_equals_tool_name() {
+        let result = normalize_codex_apps_callable_name(
+            CODEX_APPS_MCP_SERVER_NAME,
+            "github",
+            Some("github"),
+            Some("GitHub"),
+        );
+        assert_eq!(result, "github");
+    }
+
+    #[test]
+    fn normalize_passes_through_for_non_codex_apps_servers() {
+        let result = normalize_codex_apps_callable_name(
+            "minimax",
+            "github_get_user_login",
+            Some("github"),
+            Some("GitHub"),
+        );
+        assert_eq!(result, "github_get_user_login");
+    }
+
+    #[test]
+    fn normalize_handles_uppercase_connector_name_via_sanitize() {
+        let result_upper = normalize_codex_apps_callable_name(
+            CODEX_APPS_MCP_SERVER_NAME,
+            "github_search_repositories",
+            Some("github"),
+            Some("GitHub"),
+        );
+        let result_github = normalize_codex_apps_callable_name(
+            CODEX_APPS_MCP_SERVER_NAME,
+            "github_search_repositories",
+            Some("github"),
+            Some("GITHUB"),
+        );
+        assert_eq!(result_upper, "search_repositories");
+        assert_eq!(result_github, "search_repositories");
+    }
+
+    #[test]
+    fn normalize_namespace_uses_double_underscore_separator() {
+        let result = normalize_codex_apps_callable_namespace(
+            CODEX_APPS_MCP_SERVER_NAME,
+            Some("GitHub"),
+        );
+        assert_eq!(result, "codex_apps__github");
+    }
+
+    #[test]
+    fn normalize_namespace_passthrough_for_non_codex_apps_servers() {
+        let result = normalize_codex_apps_callable_namespace("minimax", Some("GitHub"));
+        assert_eq!(result, "minimax");
+    }
 }
