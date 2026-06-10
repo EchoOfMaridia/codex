@@ -239,6 +239,7 @@ pub async fn run_login_with_access_token(
         config.forced_chatgpt_workspace_id.as_deref(),
         Some(&config.chatgpt_base_url),
         config.auth_keyring_backend_kind(),
+        /*agent_identity_authapi_base_url*/ None,
     )
     .await
     {

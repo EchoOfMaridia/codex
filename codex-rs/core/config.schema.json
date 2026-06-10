@@ -679,6 +679,9 @@
             "unified_exec_zsh_fork": {
               "type": "boolean"
             },
+            "use_agent_identity": {
+              "type": "boolean"
+            },
             "use_legacy_landlock": {
               "type": "boolean"
             },
@@ -4838,6 +4841,9 @@
           "type": "boolean"
         },
         "unified_exec_zsh_fork": {
+          "type": "boolean"
+        },
+        "use_agent_identity": {
           "type": "boolean"
         },
         "use_legacy_landlock": {

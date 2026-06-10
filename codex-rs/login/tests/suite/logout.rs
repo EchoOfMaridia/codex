@@ -203,6 +203,7 @@ async fn auth_manager_logout_with_revoke_uses_cached_auth() -> Result<()> {
         AuthCredentialsStoreMode::File,
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::default(),
+        /*agent_identity_authapi_base_url*/ None,
     )
     .await;
     save_auth(

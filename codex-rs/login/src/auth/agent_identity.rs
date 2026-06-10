@@ -1,81 +1,184 @@
+use std::future::Future;
 use std::sync::Arc;
 
 use codex_agent_identity::AgentIdentityKey;
+use codex_agent_identity::decode_agent_identity_jwt;
+use codex_agent_identity::fetch_agent_identity_jwks;
+use codex_agent_identity::is_retryable_registration_error;
+use codex_agent_identity::public_key_ssh_from_private_key_pkcs8_base64;
 use codex_agent_identity::register_agent_task;
 use codex_protocol::account::PlanType as AccountPlanType;
+use thiserror::Error;
 
 use crate::default_client::build_reqwest_client;
 
 use super::storage::AgentIdentityAuthRecord;
 
-#[derive(Clone, Debug)]
-pub struct AgentIdentityAuth {
-    inner: Arc<AgentIdentityAuthInner>,
+pub(super) const MAX_AGENT_IDENTITY_BOOTSTRAP_ATTEMPTS: usize = 3;
+
+#[derive(Debug, Error)]
+#[error("retryable agent identity registration failure: {message}")]
+pub(super) struct RetryableAgentIdentityRegistrationError {
+    message: String,
 }
 
-#[derive(Debug)]
-struct AgentIdentityAuthInner {
-    record: AgentIdentityAuthRecord,
-    run_task_id: String,
+impl RetryableAgentIdentityRegistrationError {
+    pub(super) fn new(message: String) -> Self {
+        Self { message }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentIdentityAuth {
+    record: Arc<AgentIdentityAuthRecord>,
 }
 
 impl AgentIdentityAuth {
-    pub async fn load(
-        record: AgentIdentityAuthRecord,
+    pub async fn from_record(
+        mut record: AgentIdentityAuthRecord,
         agent_identity_authapi_base_url: &str,
     ) -> std::io::Result<Self> {
-        let run_task_id = register_agent_task(
-            &build_reqwest_client(),
-            agent_identity_authapi_base_url,
-            key_for_record(&record),
-        )
-        .await
-        .map_err(std::io::Error::other)?;
+        public_key_ssh_from_private_key_pkcs8_base64(&record.agent_private_key)
+            .map_err(std::io::Error::other)?;
+        if record
+            .task_id
+            .as_deref()
+            .is_none_or(|task_id| task_id.trim().is_empty())
+        {
+            record.task_id = Some(
+                register_task_for_record_with_retries(&record, agent_identity_authapi_base_url)
+                    .await?,
+            );
+        }
         Ok(Self {
-            inner: Arc::new(AgentIdentityAuthInner {
-                record,
-                run_task_id,
-            }),
+            record: Arc::new(record),
         })
     }
 
+    pub async fn from_jwt(
+        jwt: &str,
+        chatgpt_base_url: &str,
+        agent_identity_authapi_base_url: &str,
+    ) -> std::io::Result<Self> {
+        let record = verified_record_from_jwt(jwt, chatgpt_base_url).await?;
+        Self::from_record(record, agent_identity_authapi_base_url).await
+    }
+
     #[cfg(test)]
-    fn from_initialized_record(record: AgentIdentityAuthRecord, run_task_id: String) -> Self {
+    fn from_initialized_record(mut record: AgentIdentityAuthRecord, run_task_id: String) -> Self {
+        record.task_id = Some(run_task_id);
         Self {
-            inner: Arc::new(AgentIdentityAuthInner {
-                record,
-                run_task_id,
-            }),
+            record: Arc::new(record),
         }
     }
 
     pub fn record(&self) -> &AgentIdentityAuthRecord {
-        &self.inner.record
+        self.record.as_ref()
     }
 
     pub fn run_task_id(&self) -> &str {
-        &self.inner.run_task_id
+        match self.record.task_id.as_deref() {
+            Some(task_id) => task_id,
+            None => unreachable!("AgentIdentityAuth should only be constructed with a task_id"),
+        }
     }
 
     pub fn account_id(&self) -> &str {
-        &self.inner.record.account_id
+        &self.record.account_id
     }
 
     pub fn chatgpt_user_id(&self) -> &str {
-        &self.inner.record.chatgpt_user_id
+        &self.record.chatgpt_user_id
     }
 
     pub fn email(&self) -> &str {
-        &self.inner.record.email
+        &self.record.email
     }
 
     pub fn plan_type(&self) -> AccountPlanType {
-        self.inner.record.plan_type
+        self.record.plan_type
     }
 
     pub fn is_fedramp_account(&self) -> bool {
-        self.inner.record.chatgpt_account_is_fedramp
+        self.record.chatgpt_account_is_fedramp
     }
+}
+
+pub(super) async fn verified_record_from_jwt(
+    jwt: &str,
+    chatgpt_base_url: &str,
+) -> std::io::Result<AgentIdentityAuthRecord> {
+    AgentIdentityAuthRecord::from_agent_identity_jwt(jwt)?;
+    let jwks = fetch_agent_identity_jwks(&build_reqwest_client(), chatgpt_base_url)
+        .await
+        .map_err(std::io::Error::other)?;
+    let claims = decode_agent_identity_jwt(jwt, Some(&jwks)).map_err(std::io::Error::other)?;
+    Ok(claims.into())
+}
+
+pub(super) fn is_retryable_io_registration_error(err: &std::io::Error) -> bool {
+    err.get_ref().is_some_and(
+        <dyn std::error::Error + std::marker::Send + std::marker::Sync + 'static>::is::<
+            RetryableAgentIdentityRegistrationError,
+        >,
+    )
+}
+
+pub(super) async fn retry_registration<T, F, Fut>(mut operation: F) -> std::io::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = std::io::Result<T>>,
+{
+    let mut attempt = 1;
+    loop {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(err)
+                if attempt < MAX_AGENT_IDENTITY_BOOTSTRAP_ATTEMPTS
+                    && is_retryable_io_registration_error(&err) =>
+            {
+                tracing::warn!(
+                    attempt,
+                    max_attempts = MAX_AGENT_IDENTITY_BOOTSTRAP_ATTEMPTS,
+                    error = %err,
+                    "agent identity registration attempt failed; retrying"
+                );
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+async fn register_task_for_record_with_retries(
+    record: &AgentIdentityAuthRecord,
+    agent_identity_authapi_base_url: &str,
+) -> std::io::Result<String> {
+    retry_registration(|| async {
+        register_task_for_record(record, agent_identity_authapi_base_url).await
+    })
+    .await
+}
+
+async fn register_task_for_record(
+    record: &AgentIdentityAuthRecord,
+    agent_identity_authapi_base_url: &str,
+) -> std::io::Result<String> {
+    register_agent_task(
+        &build_reqwest_client(),
+        agent_identity_authapi_base_url,
+        key_for_record(record),
+    )
+    .await
+    .map_err(|err| {
+        if is_retryable_registration_error(&err) {
+            std::io::Error::other(RetryableAgentIdentityRegistrationError::new(
+                err.to_string(),
+            ))
+        } else {
+            std::io::Error::other(err)
+        }
+    })
 }
 
 fn key_for_record(record: &AgentIdentityAuthRecord) -> AgentIdentityKey<'_> {
@@ -111,6 +214,7 @@ mod tests {
             email: "agent@example.com".to_string(),
             plan_type: AccountPlanType::Plus,
             chatgpt_account_is_fedramp: false,
+            task_id: None,
         }
     }
 
@@ -120,7 +224,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_registers_run_task() -> anyhow::Result<()> {
+    async fn from_record_registers_task() -> anyhow::Result<()> {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/agent/agent-runtime-1/task/register"))
@@ -131,9 +235,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let auth =
-            AgentIdentityAuth::load(agent_identity_record_with_generated_key(), &server.uri())
-                .await?;
+        let auth = AgentIdentityAuth::from_record(
+            agent_identity_record_with_generated_key(),
+            &server.uri(),
+        )
+        .await?;
 
         assert_eq!(auth.run_task_id(), "task-run-1");
         let requests = server
@@ -160,12 +266,12 @@ mod tests {
         );
         let cloned = auth.clone();
 
-        assert!(Arc::ptr_eq(&auth.inner, &cloned.inner));
+        assert!(Arc::ptr_eq(&auth.record, &cloned.record));
         assert_eq!(cloned.run_task_id(), "task-run-1");
     }
 
     #[tokio::test]
-    async fn failed_run_task_registration_can_be_retried_on_next_call() -> anyhow::Result<()> {
+    async fn from_record_retries_transient_registration() -> anyhow::Result<()> {
         let server = MockServer::start().await;
         let request_count = Arc::new(AtomicUsize::new(0));
         let response_count = Arc::clone(&request_count);
@@ -183,11 +289,11 @@ mod tests {
             .expect(2)
             .mount(&server)
             .await;
-        let record = agent_identity_record_with_generated_key();
-        AgentIdentityAuth::load(record.clone(), &server.uri())
-            .await
-            .expect_err("first registration should fail");
-        let auth = AgentIdentityAuth::load(record, &server.uri()).await?;
+        let auth = AgentIdentityAuth::from_record(
+            agent_identity_record_with_generated_key(),
+            &server.uri(),
+        )
+        .await?;
 
         assert_eq!(request_count.load(Ordering::SeqCst), 2);
         assert_eq!(auth.run_task_id(), "task-run-1");

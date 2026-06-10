@@ -65,6 +65,7 @@ pub async fn cloud_config_bundle_loader_for_storage(
         credentials_store_mode,
         Some(chatgpt_base_url.clone()),
         keyring_backend_kind,
+        /*agent_identity_authapi_base_url*/ None,
     )
     .await;
     cloud_config_bundle_loader(auth_manager, chatgpt_base_url, codex_home)
