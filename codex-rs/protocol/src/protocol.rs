@@ -2335,9 +2335,6 @@ pub struct McpToolCallEndEvent {
     pub mcp_app_resource_uri: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub link_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
     pub plugin_id: Option<String>,
     #[ts(type = "string")]
     pub duration: Duration,
@@ -4939,7 +4936,6 @@ mod tests {
                 arguments: json!({"arg": "value"}),
                 connector_id: Some("connector".into()),
                 mcp_app_resource_uri: Some("app://connector".into()),
-                link_id: Some("link_123".into()),
                 plugin_id: Some("sample@test".into()),
                 status: McpToolCallStatus::InProgress,
                 result: None,
@@ -5048,7 +5044,6 @@ mod tests {
                 arguments: json!({"arg": "value"}),
                 connector_id: Some("connector".into()),
                 mcp_app_resource_uri: Some("app://connector".into()),
-                link_id: Some("link_123".into()),
                 plugin_id: Some("sample@test".into()),
                 status: McpToolCallStatus::Completed,
                 result: Some(CallToolResult {
@@ -5074,7 +5069,6 @@ mod tests {
                     event.mcp_app_resource_uri.as_deref(),
                     Some("app://connector")
                 );
-                assert_eq!(event.link_id.as_deref(), Some("link_123"));
                 assert_eq!(event.plugin_id.as_deref(), Some("sample@test"));
                 assert_eq!(event.duration, Duration::from_millis(42));
                 assert!(event.is_success());
@@ -5094,7 +5088,6 @@ mod tests {
             },
             connector_id: Some("connector".into()),
             mcp_app_resource_uri: Some("app://connector".into()),
-            link_id: Some("link_123".into()),
             plugin_id: Some("sample@test".into()),
             duration: Duration::from_millis(42),
             result: Ok(CallToolResult {
@@ -5109,7 +5102,6 @@ mod tests {
             .as_object_mut()
             .expect("MCP tool call end event should serialize as an object");
         object.remove("connector_id");
-        object.remove("link_id");
 
         let deserialized: McpToolCallEndEvent =
             serde_json::from_value(value).expect("deserialize legacy MCP tool call end event");
@@ -5118,7 +5110,6 @@ mod tests {
             deserialized,
             McpToolCallEndEvent {
                 connector_id: None,
-                link_id: None,
                 ..event
             }
         );

@@ -640,7 +640,6 @@ async fn thread_resume_redacts_payloads_for_chatgpt_remote_clients() -> Result<(
             let ThreadItem::McpToolCall {
                 arguments,
                 connector_id,
-                link_id,
                 result,
                 error,
                 ..
@@ -650,7 +649,6 @@ async fn thread_resume_redacts_payloads_for_chatgpt_remote_clients() -> Result<(
             };
             assert_eq!(arguments, &json!("[redacted]"));
             assert_eq!(connector_id.as_deref(), Some("calendar"));
-            assert_eq!(link_id.as_deref(), Some("link_calendar"));
             let result = result.as_ref().expect("redacted MCP result");
             assert_eq!(
                 result.content,
@@ -686,7 +684,6 @@ async fn thread_resume_redacts_payloads_for_chatgpt_remote_clients() -> Result<(
     let ThreadItem::McpToolCall {
         arguments,
         connector_id,
-        link_id,
         result,
         ..
     } = normal_mcp_item
@@ -695,7 +692,6 @@ async fn thread_resume_redacts_payloads_for_chatgpt_remote_clients() -> Result<(
     };
     assert_eq!(arguments, &json!({"secret":"argument"}));
     assert_eq!(connector_id.as_deref(), Some("calendar"));
-    assert_eq!(link_id.as_deref(), Some("link_calendar"));
     let result = result.as_ref().expect("normal MCP result");
     assert_eq!(
         result.content,
@@ -799,7 +795,6 @@ fn append_resume_redaction_history(
             },
             connector_id: Some("calendar".to_string()),
             mcp_app_resource_uri: Some("ui://widget/lookup.html".to_string()),
-            link_id: Some("link_calendar".to_string()),
             plugin_id: None,
             duration: Duration::from_millis(8),
             result: Ok(CallToolResult {
