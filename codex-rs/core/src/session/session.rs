@@ -1029,6 +1029,11 @@ impl Session {
                     Self::build_model_client_beta_features_header(config.as_ref()),
                     attestation_provider,
                 )
+                .with_agent_identity_policy(if config.features.enabled(Feature::UseAgentIdentity) {
+                    codex_login::auth::AgentIdentityAuthPolicy::ChatGptAuth
+                } else {
+                    codex_login::auth::AgentIdentityAuthPolicy::JwtOnly
+                })
                 .with_prompt_cache_key_override(
                     crate::guardian::prompt_cache_key_override_for_review_session(
                         &session_configuration.session_source,
