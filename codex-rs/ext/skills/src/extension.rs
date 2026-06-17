@@ -1,7 +1,17 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
+use codex_analytics::AnalyticsEventsClient;
+use codex_analytics::InvocationType;
+use codex_analytics::SkillInvocation;
+use codex_analytics::build_track_events_context;
+use codex_connectors::ExplicitConnectorMentions;
 use codex_core_skills::HostSkillsSnapshot;
-use codex_core_skills::injection::InjectedHostSkillPrompts;
+use codex_core_skills::SkillMetadata;
+use codex_core_skills::injection::ToolMentionKind;
+use codex_core_skills::injection::app_id_from_path;
+use codex_core_skills::injection::extract_tool_mentions;
+use codex_core_skills::injection::tool_kind_for_path;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_extension_api::ConfigContributor;
 use codex_extension_api::ContextContributionContext;
@@ -20,6 +30,9 @@ use codex_extension_api::ToolExecutor;
 use codex_extension_api::TurnInputContext;
 use codex_extension_api::TurnInputContributor;
 use codex_mcp::McpResourceClient;
+use codex_mcp::McpServerDependencies;
+use codex_mcp::McpServerDependency;
+use codex_otel::SessionTelemetry;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -111,6 +124,7 @@ where
         Box::pin(async move {
             let session_store = context.session_store;
             let thread_store = context.thread_store;
+            let turn_store = context.turn_store;
             let Some(thread_state) = thread_store.get::<SkillsThreadState>() else {
                 return Vec::new();
             };
@@ -118,11 +132,11 @@ where
             if !config.include_instructions {
                 return Vec::new();
             }
-            let host_snapshot = context.turn_store.get::<HostSkillsSnapshot>();
+            let host_snapshot = turn_store.get::<HostSkillsSnapshot>();
             let catalog = self
                 .list_skills(
                     SkillListQuery {
-                        turn_id: context.turn_store.level_id().to_string(),
+                        turn_id: turn_store.level_id().to_string(),
                         executor_roots: thread_state.selected_roots().to_vec(),
                         host_snapshot: host_snapshot.clone(),
                         include_host_skills: true,
@@ -199,21 +213,53 @@ where
                 turn_id: input.turn_id.clone(),
                 executor_roots: thread_state.selected_roots().to_vec(),
                 host_snapshot: host_snapshot.clone(),
-                include_host_skills: false,
+                include_host_skills: true,
                 include_bundled_skills: config.bundled_skills_enabled,
                 include_orchestrator_skills: thread_state.orchestrator_skills_enabled(),
                 mcp_resources: session_store.get::<McpResourceClient>(),
             };
             let catalog = self.list_skills(query, &thread_state).await;
             for warning in &catalog.warnings {
-                self.emit_warning(&input.turn_id, warning.clone());
+                self.emit_warning(thread_store.level_id(), warning.clone());
             }
 
-            let selected_entries = collect_explicit_skill_mentions(&input.user_input, &catalog);
+            let selected_entries = collect_explicit_skill_mentions(
+                &input.user_input,
+                &catalog,
+                &input.reserved_plain_tool_names,
+            );
             let mut fragments: Vec<Box<dyn ContextualUserFragment + Send>> = Vec::new();
+            let skill_names = catalog
+                .entries
+                .iter()
+                .filter(|entry| entry.enabled)
+                .map(|entry| entry.name.to_ascii_lowercase())
+                .collect::<HashSet<_>>();
+            let mut mcp_dependencies = McpServerDependencies::default();
+            for entry in &selected_entries {
+                for dependency in entry
+                    .dependencies
+                    .iter()
+                    .flat_map(|dependencies| &dependencies.tools)
+                    .filter(|dependency| dependency.r#type.eq_ignore_ascii_case("mcp"))
+                {
+                    mcp_dependencies.push(McpServerDependency {
+                        source_name: entry.name.clone(),
+                        name: dependency.value.clone(),
+                        transport: dependency.transport.clone(),
+                        command: dependency.command.clone(),
+                        url: dependency.url.clone(),
+                    });
+                }
+            }
+            if !mcp_dependencies.is_empty() {
+                turn_store.insert(mcp_dependencies);
+            }
+
             let mut warnings = catalog.warnings.clone();
             let mut main_prompts_injected = false;
-            let mut injected_host_skill_prompts = InjectedHostSkillPrompts::default();
+            let mut connector_mentions = ExplicitConnectorMentions::default();
+            let mut skill_invocations = Vec::new();
             for entry in &selected_entries {
                 match self
                     .read_main_prompt(entry, host_snapshot.clone(), session_store, &thread_state)
@@ -222,12 +268,41 @@ where
                     Ok(read_result) => {
                         let (contents, truncated) =
                             truncate_main_prompt_contents(read_result.contents.as_str());
+                        let tool_mentions = extract_tool_mentions(&contents);
+                        for path in tool_mentions.paths() {
+                            if tool_kind_for_path(path) == ToolMentionKind::App
+                                && let Some(connector_id) = app_id_from_path(path)
+                            {
+                                connector_mentions.insert_connector_id(connector_id);
+                            }
+                        }
+                        for name in tool_mentions.plain_names() {
+                            if !skill_names.contains(&name.to_ascii_lowercase()) {
+                                connector_mentions.insert_plain_name(name);
+                            }
+                        }
+                        if let Some(skill) = host_skill_for_entry(host_snapshot.as_deref(), entry) {
+                            if let Some(telemetry) = turn_store.get::<SessionTelemetry>() {
+                                telemetry.counter(
+                                    "codex.skill.injected",
+                                    /*inc*/ 1,
+                                    &[("status", "ok"), ("skill", skill.name.as_str())],
+                                );
+                            }
+                            skill_invocations.push(SkillInvocation {
+                                skill_name: skill.name.clone(),
+                                skill_scope: skill.scope,
+                                skill_path: skill.path_to_skills_md.to_path_buf(),
+                                plugin_id: skill.plugin_id.clone(),
+                                invocation_type: InvocationType::Explicit,
+                            });
+                        }
                         if truncated {
                             let warning = format!(
                                 "Skill `{}` exceeded the main prompt context limit and was truncated.",
                                 entry.name
                             );
-                            self.emit_warning(&input.turn_id, warning.clone());
+                            self.emit_warning(thread_store.level_id(), warning.clone());
                             warnings.push(warning);
                         }
                         let fragment = SkillInstructions {
@@ -241,33 +316,35 @@ where
                         };
                         fragments.push(Box::new(fragment));
                         main_prompts_injected = true;
-                        if entry.authority.kind == SkillSourceKind::Host {
-                            injected_host_skill_prompts.insert_path(entry.main_prompt.as_str());
-                        }
                     }
                     Err(message) => {
+                        if let Some(skill) = host_skill_for_entry(host_snapshot.as_deref(), entry)
+                            && let Some(telemetry) = turn_store.get::<SessionTelemetry>()
+                        {
+                            telemetry.counter(
+                                "codex.skill.injected",
+                                /*inc*/ 1,
+                                &[("status", "error"), ("skill", skill.name.as_str())],
+                            );
+                        }
                         let warning = format!("Failed to load skill `{}`: {message}", entry.name);
-                        self.emit_warning(&input.turn_id, warning.clone());
+                        self.emit_warning(thread_store.level_id(), warning.clone());
                         warnings.push(warning);
                     }
                 }
             }
-
-            if let Some(host_snapshot) = &host_snapshot {
-                for entry in selected_entries
-                    .iter()
-                    .filter(|entry| entry.authority.kind != SkillSourceKind::Host)
-                {
-                    for host_skill in host_snapshot
-                        .outcome()
-                        .skills
-                        .iter()
-                        .filter(|host_skill| host_skill.name == entry.name)
-                    {
-                        injected_host_skill_prompts
-                            .insert_path(host_skill.path_to_skills_md.to_string_lossy());
-                    }
-                }
+            if !connector_mentions.is_empty() {
+                turn_store.insert(connector_mentions);
+            }
+            if let Some(analytics) = session_store.get::<AnalyticsEventsClient>() {
+                analytics.track_skill_invocations(
+                    build_track_events_context(
+                        input.model,
+                        thread_store.level_id().to_string(),
+                        input.turn_id,
+                    ),
+                    skill_invocations,
+                );
             }
 
             turn_store.insert(SkillsTurnState {
@@ -276,9 +353,6 @@ where
                 warnings,
                 main_prompts_injected,
             });
-            if !injected_host_skill_prompts.is_empty() {
-                turn_store.insert(injected_host_skill_prompts);
-            }
 
             fragments
         })
@@ -332,12 +406,25 @@ impl<C> SkillsExtension<C> {
             .map_err(|err| err.message)
     }
 
-    fn emit_warning(&self, turn_id: &str, message: String) {
+    fn emit_warning(&self, thread_id: &str, message: String) {
         self.event_sink.emit(Event {
-            id: turn_id.to_string(),
+            id: thread_id.to_string(),
             msg: EventMsg::Warning(WarningEvent { message }),
         });
     }
+}
+
+fn host_skill_for_entry<'a>(
+    host_snapshot: Option<&'a HostSkillsSnapshot>,
+    entry: &SkillCatalogEntry,
+) -> Option<&'a SkillMetadata> {
+    if entry.authority.kind != SkillSourceKind::Host {
+        return None;
+    }
+    host_snapshot?.outcome().skills.iter().find(|skill| {
+        let path = skill.path_to_skills_md.to_string_lossy();
+        path == entry.main_prompt.as_str() || path.replace('\\', "/") == entry.main_prompt.as_str()
+    })
 }
 
 pub fn install<C>(
