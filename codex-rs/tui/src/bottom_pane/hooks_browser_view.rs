@@ -440,13 +440,18 @@ impl HooksBrowserView {
                 } else {
                     ' '
                 };
+                let title = hook_title(idx);
+                let label = match hook.status_message.as_deref() {
+                    Some(status_message) => format!("{title} · {status_message}"),
+                    None => title,
+                };
                 let row = match hook.trust_status {
                     HookTrustStatus::Modified => {
-                        format!("[{marker}] {} · modified", hook_title(idx))
+                        format!("[{marker}] {label} · modified")
                     }
-                    HookTrustStatus::Untrusted => format!("[{marker}] {} · new", hook_title(idx)),
+                    HookTrustStatus::Untrusted => format!("[{marker}] {label} · new"),
                     HookTrustStatus::Managed | HookTrustStatus::Trusted => {
-                        format!("[{marker}] {}", hook_title(idx))
+                        format!("[{marker}] {label}")
                     }
                 };
                 let mut line = Line::from(row);
@@ -950,7 +955,7 @@ mod tests {
 
     fn view() -> HooksBrowserView {
         let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
-        HooksBrowserView::new(
+        let mut view = HooksBrowserView::new(
             vec![
                 hook(
                     "plugin:superpowers",
@@ -986,7 +991,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
             AppEventSender::new(tx_raw),
-        )
+        );
+        view.entry.hooks[0].status_message =
+            Some("Rejects commands that violate project policy".to_string());
+        view
     }
 
     #[test]
