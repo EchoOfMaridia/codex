@@ -236,6 +236,7 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
                 tty: None,
             },
             command: req.hook_command.clone(),
+            environment_id: req.turn_environment.environment_id.clone(),
         })
     }
 

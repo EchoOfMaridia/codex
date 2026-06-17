@@ -256,6 +256,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
                 tty: Some(req.tty),
             },
             command: req.hook_command.clone(),
+            environment_id: req.turn_environment.environment_id.clone(),
         })
     }
 
