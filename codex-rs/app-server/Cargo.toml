@@ -125,6 +125,7 @@ rmcp = { workspace = true, default-features = false, features = [
     "transport-streamable-http-server",
 ] }
 serial_test = { workspace = true }
+sentry = { workspace = true }
 sha2 = { workspace = true }
 shlex = { workspace = true }
 tar = { workspace = true }

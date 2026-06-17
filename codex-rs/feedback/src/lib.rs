@@ -163,6 +163,7 @@ pub fn emit_feedback_request_tags_with_auth_env(
 #[derive(Clone)]
 pub struct CodexFeedback {
     inner: Arc<FeedbackInner>,
+    transport: Arc<dyn sentry::TransportFactory>,
 }
 
 impl Default for CodexFeedback {
@@ -176,9 +177,18 @@ impl CodexFeedback {
         Self::with_capacity(DEFAULT_MAX_BYTES)
     }
 
+    /// Creates a feedback collector that uploads through the supplied Sentry transport.
+    pub fn new_with_transport(transport: Arc<dyn sentry::TransportFactory>) -> Self {
+        Self {
+            inner: Arc::new(FeedbackInner::new(DEFAULT_MAX_BYTES)),
+            transport,
+        }
+    }
+
     pub(crate) fn with_capacity(max_bytes: usize) -> Self {
         Self {
             inner: Arc::new(FeedbackInner::new(max_bytes)),
+            transport: Arc::new(sentry::transports::DefaultTransportFactory {}),
         }
     }
 
@@ -239,6 +249,7 @@ impl CodexFeedback {
             thread_id: session_id
                 .map(|id| id.to_string())
                 .unwrap_or("no-active-thread-".to_string() + &ThreadId::new().to_string()),
+            transport: Arc::clone(&self.transport),
         }
     }
 }
@@ -340,6 +351,7 @@ pub struct FeedbackSnapshot {
     tags: BTreeMap<String, String>,
     feedback_diagnostics: FeedbackDiagnostics,
     pub thread_id: String,
+    transport: Arc<dyn sentry::TransportFactory>,
 }
 
 pub struct FeedbackAttachmentPath {
@@ -425,13 +437,12 @@ impl FeedbackSnapshot {
         use sentry::protocol::EnvelopeItem;
         use sentry::protocol::Event;
         use sentry::protocol::Level;
-        use sentry::transports::DefaultTransportFactory;
         use sentry::types::Dsn;
 
         // Build Sentry client
         let client = Client::from_config(ClientOptions {
             dsn: Some(Dsn::from_str(SENTRY_DSN).map_err(|e| anyhow!("invalid DSN: {e}"))?),
-            transport: Some(Arc::new(DefaultTransportFactory {})),
+            transport: Some(Arc::clone(&self.transport)),
             ..Default::default()
         });
 
@@ -808,12 +819,9 @@ mod tests {
         tags.insert("reason".to_string(), "wrong-reason".to_string());
         tags.insert("account_id".to_string(), "actual-account".to_string());
         tags.insert("model".to_string(), "gpt-5".to_string());
-        let snapshot = FeedbackSnapshot {
-            bytes: Vec::new(),
-            tags,
-            feedback_diagnostics: FeedbackDiagnostics::default(),
-            thread_id: "thread-123".to_string(),
-        };
+        let mut snapshot = CodexFeedback::new().snapshot(/*session_id*/ None);
+        snapshot.tags = tags;
+        snapshot.thread_id = "thread-123".to_string();
         let mut client_tags = BTreeMap::new();
         client_tags.insert("thread_id".to_string(), "wrong-client-thread".to_string());
         client_tags.insert("turn_id".to_string(), "turn-456".to_string());

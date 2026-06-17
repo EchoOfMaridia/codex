@@ -3,6 +3,11 @@ use super::*;
 use codex_feedback::WINDOWS_SANDBOX_LOG_ATTACHMENT_FILENAME;
 
 const MAX_FEEDBACK_TREE_THREADS: usize = 8;
+const APPGEN_FEEDBACK_ID_FIELDS: [(&str, &str); 3] = [
+    ("project_id", "appgprj_"),
+    ("deployment_id", "appgdep_"),
+    ("version_id", "appgver_"),
+];
 
 #[derive(Clone)]
 pub(crate) struct FeedbackRequestProcessor {
@@ -69,6 +74,53 @@ impl FeedbackRequestProcessor {
             },
             None => None,
         };
+
+        if let Some(conversation_id) = conversation_id
+            && !APPGEN_FEEDBACK_ID_FIELDS
+                .iter()
+                .any(|(field, _)| upload_tags.contains_key(*field))
+        {
+            let history_items = match self.thread_manager.get_thread(conversation_id).await {
+                Ok(conversation) => {
+                    match conversation.load_history(/*include_archived*/ true).await {
+                        Ok(history) => Some(history.items),
+                        Err(err) => {
+                            warn!(
+                                "failed to load live thread history for feedback tags for thread_id={conversation_id}: {err}"
+                            );
+                            None
+                        }
+                    }
+                }
+                Err(live_err) => {
+                    match self
+                        .resolve_rollout_path(conversation_id, self.state_db.as_ref())
+                        .await
+                    {
+                        Some(path) => {
+                            match codex_core::RolloutRecorder::load_rollout_items(&path).await {
+                                Ok((items, _, _)) => Some(items),
+                                Err(err) => {
+                                    warn!(
+                                        "failed to load stored thread history for feedback tags for thread_id={conversation_id}: {err}"
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        None => {
+                            warn!(
+                                "failed to resolve thread history for feedback tags for thread_id={conversation_id}: {live_err}"
+                            );
+                            None
+                        }
+                    }
+                }
+            };
+            if let Some(history_items) = history_items {
+                upload_tags.extend(appgen_feedback_tags(&history_items));
+            }
+        }
 
         if let Some(chatgpt_user_id) = self
             .auth_manager
@@ -292,6 +344,95 @@ impl FeedbackRequestProcessor {
     }
 }
 
+fn appgen_feedback_tags(items: &[RolloutItem]) -> BTreeMap<String, String> {
+    let mut tags = BTreeMap::new();
+    let mut context_project_id = None;
+    // Reuse the app-server history projection so rollback and legacy MCP events have the same
+    // semantics here as they do in thread/read and thread/turns/list.
+    let turns = codex_app_server_protocol::build_turns_from_rollout_items(items);
+    for item in turns.into_iter().flat_map(|turn| turn.items) {
+        let ThreadItem::McpToolCall {
+            server,
+            arguments,
+            result: Some(_),
+            ..
+        } = item
+        else {
+            continue;
+        };
+        if server != codex_mcp::CODEX_APPS_MCP_SERVER_NAME {
+            continue;
+        }
+        // Keep returned MCP error results: plugin-service logs their arguments too, and those
+        // downstream failures are often exactly what feedback needs to correlate. Calls rejected
+        // locally have no result and therefore no matching plugin-service log.
+        let Some(arguments) = arguments.as_object() else {
+            continue;
+        };
+        let mut call_tags = BTreeMap::new();
+        for (field, prefix) in APPGEN_FEEDBACK_ID_FIELDS {
+            let Some(value) = arguments
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| valid_appgen_id(field, prefix, value))
+            else {
+                continue;
+            };
+            call_tags.insert(field.to_string(), value.to_string());
+        }
+
+        let explicit_project_id = call_tags.get("project_id").cloned();
+        let version_project_id = call_tags
+            .get("version_id")
+            .and_then(|version_id| split_compound_appgen_version_id(version_id))
+            .map(|(project_id, _)| project_id.to_string());
+        if explicit_project_id.is_some()
+            && version_project_id.is_some()
+            && explicit_project_id != version_project_id
+        {
+            call_tags.remove("version_id");
+        }
+        let next_project_id = explicit_project_id.or(version_project_id);
+        if let Some(next_project_id) = next_project_id {
+            if context_project_id
+                .as_ref()
+                .is_some_and(|project_id| project_id != &next_project_id)
+                || context_project_id.is_none() && !tags.is_empty()
+            {
+                tags.clear();
+            }
+            context_project_id = Some(next_project_id);
+        } else if !call_tags.is_empty() {
+            // Without a project identity, this call cannot safely extend the previous project's
+            // tuple. Keep only this call's exact OLogs keys as a standalone correlation context.
+            tags.clear();
+            context_project_id = None;
+        }
+        tags.extend(call_tags);
+    }
+    tags
+}
+
+fn valid_appgen_id(field: &str, prefix: &str, value: &str) -> bool {
+    if field == "version_id" && split_compound_appgen_version_id(value).is_some() {
+        return true;
+    }
+    valid_prefixed_hex_id(value, prefix)
+}
+
+fn split_compound_appgen_version_id(value: &str) -> Option<(&str, &str)> {
+    let (project_id, version_id) = value.split_once('~')?;
+    (valid_prefixed_hex_id(project_id, "appgprj_") && valid_prefixed_hex_id(version_id, "appgver_"))
+        .then_some((project_id, version_id))
+}
+
+fn valid_prefixed_hex_id(value: &str, prefix: &str) -> bool {
+    let Some(suffix) = value.strip_prefix(prefix) else {
+        return false;
+    };
+    !suffix.is_empty() && suffix.len() <= 64 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn auto_review_rollout_filename(thread_id: ThreadId) -> String {
     format!("auto-review-rollout-{thread_id}.jsonl")
 }
@@ -338,3 +479,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "feedback_processor_tests.rs"]
+mod feedback_tests;
