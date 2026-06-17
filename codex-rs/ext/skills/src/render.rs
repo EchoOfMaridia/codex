@@ -5,10 +5,15 @@ use crate::catalog::SkillCatalogEntry;
 use crate::catalog::SkillSourceKind;
 use crate::fragments::AvailableSkillsInstructions;
 use codex_core_skills::HostSkillsSnapshot;
+use codex_core_skills::SkillRenderReport;
 use codex_core_skills::build_available_skills;
 use codex_core_skills::default_skill_metadata_budget;
 use codex_core_skills::render::SkillCatalogMode;
-use codex_core_skills::render::SkillRenderSideEffects;
+use codex_otel::SessionTelemetry;
+use codex_otel::THREAD_SKILLS_DESCRIPTION_TRUNCATED_CHARS_METRIC;
+use codex_otel::THREAD_SKILLS_ENABLED_TOTAL_METRIC;
+use codex_otel::THREAD_SKILLS_KEPT_TOTAL_METRIC;
+use codex_otel::THREAD_SKILLS_TRUNCATED_METRIC;
 
 const MAX_AVAILABLE_SKILLS_BYTES: usize = 8_000;
 const MAX_MAIN_PROMPT_BYTES: usize = 8_000;
@@ -19,6 +24,7 @@ pub(crate) fn available_skills_fragment(
     catalog: &SkillCatalog,
     host_snapshot: Option<&HostSkillsSnapshot>,
     model_context_window: Option<i64>,
+    session_telemetry: Option<&SessionTelemetry>,
 ) -> Option<(AvailableSkillsInstructions, Option<String>)> {
     let visible_entries = catalog
         .entries
@@ -36,11 +42,15 @@ pub(crate) fn available_skills_fragment(
                 .copied()
                 .filter(|entry| entry.authority.kind != SkillSourceKind::Host),
         );
-        if let Some(available) = build_available_skills(
+        let available = build_available_skills(
             host_snapshot.outcome(),
             default_skill_metadata_budget(model_context_window),
-            SkillRenderSideEffects::None,
-        ) {
+        );
+        record_skill_render_metrics(
+            session_telemetry,
+            available.as_ref().map(|item| &item.report),
+        );
+        if let Some(available) = available {
             let warning = available.warning_message.clone();
             return Some((
                 AvailableSkillsInstructions::from_available_skills_with_additional_lines(
@@ -108,6 +118,32 @@ fn bounded_skill_lines<'a>(
         ));
     }
     skill_lines
+}
+
+fn record_skill_render_metrics(
+    session_telemetry: Option<&SessionTelemetry>,
+    report: Option<&SkillRenderReport>,
+) {
+    let Some(session_telemetry) = session_telemetry else {
+        return;
+    };
+    let (total_count, included_count, truncated, truncated_description_chars) =
+        report.map_or((0, 0, 0, 0), |report| {
+            (
+                i64::try_from(report.total_count).unwrap_or(i64::MAX),
+                i64::try_from(report.included_count).unwrap_or(i64::MAX),
+                i64::from(report.omitted_count > 0),
+                i64::try_from(report.truncated_description_chars).unwrap_or(i64::MAX),
+            )
+        });
+    session_telemetry.histogram(THREAD_SKILLS_ENABLED_TOTAL_METRIC, total_count, &[]);
+    session_telemetry.histogram(THREAD_SKILLS_KEPT_TOTAL_METRIC, included_count, &[]);
+    session_telemetry.histogram(THREAD_SKILLS_TRUNCATED_METRIC, truncated, &[]);
+    session_telemetry.histogram(
+        THREAD_SKILLS_DESCRIPTION_TRUNCATED_CHARS_METRIC,
+        truncated_description_chars,
+        &[],
+    );
 }
 
 fn render_skill_line(entry: &SkillCatalogEntry, description: &str) -> String {
