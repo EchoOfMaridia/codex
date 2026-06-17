@@ -927,3 +927,277 @@ beta = "b"
 
     Ok(())
 }
+
+#[tokio::test]
+async fn batch_write_preserves_existing_mcp_server_with_subtable() -> Result<()> {
+    let tmp = tempdir().expect("tempdir");
+    let path = tmp.path().join(CONFIG_TOML_FILE);
+    let original = r#"model = "MiniMax-M3"
+
+[mcp_servers.minimax]
+command = "uvx"
+args = ["minimax-coding-plan-mcp", "-y"]
+startup_timeout_sec = 30.0
+tool_timeout_sec = 60.0
+
+[mcp_servers.minimax.env]
+MINIMAX_API_HOST = "https://api.minimax.io"
+MINIMAX_API_KEY = "sk-cp-test"
+"#;
+    std::fs::write(&path, original)?;
+
+    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+    let response = service
+        .batch_write(ConfigBatchWriteParams {
+            edits: vec![
+                codex_app_server_protocol::ConfigEdit {
+                    key_path: "model".to_string(),
+                    value: serde_json::json!("MiniMax-M3"),
+                    merge_strategy: MergeStrategy::Replace,
+                },
+                codex_app_server_protocol::ConfigEdit {
+                    key_path: "model_reasoning_effort".to_string(),
+                    value: serde_json::json!("medium"),
+                    merge_strategy: MergeStrategy::Replace,
+                },
+            ],
+            file_path: Some(path.display().to_string()),
+            expected_version: None,
+            reload_user_config: false,
+        })
+        .await
+        .expect("batch write succeeds for unchanged model");
+
+    assert_eq!(response.status, WriteStatus::Ok);
+
+    let updated = std::fs::read_to_string(&path)?;
+    let expected = r#"model = "MiniMax-M3"
+model_reasoning_effort = "medium"
+
+[mcp_servers.minimax]
+command = "uvx"
+args = ["minimax-coding-plan-mcp", "-y"]
+startup_timeout_sec = 30.0
+tool_timeout_sec = 60.0
+
+[mcp_servers.minimax.env]
+MINIMAX_API_HOST = "https://api.minimax.io"
+MINIMAX_API_KEY = "sk-cp-test"
+"#;
+    assert_eq!(updated, expected);
+    Ok(())
+}
+
+#[tokio::test]
+async fn batch_write_upsert_through_nested_path_preserves_mcp_server() -> Result<()> {
+    let tmp = tempdir().expect("tempdir");
+    let path = tmp.path().join(CONFIG_TOML_FILE);
+    let original = r#"model = "MiniMax-M3"
+
+[mcp_servers.minimax]
+command = "uvx"
+args = ["minimax-coding-plan-mcp", "-y"]
+startup_timeout_sec = 30.0
+tool_timeout_sec = 60.0
+
+[mcp_servers.minimax.env]
+MINIMAX_API_HOST = "https://api.minimax.io"
+MINIMAX_API_KEY = "sk-cp-test"
+"#;
+    std::fs::write(&path, original)?;
+
+    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+    service
+        .batch_write(ConfigBatchWriteParams {
+            edits: vec![codex_app_server_protocol::ConfigEdit {
+                key_path: "hooks.state".to_string(),
+                value: serde_json::json!({
+                    "my-hook": { "enabled": true }
+                }),
+                merge_strategy: MergeStrategy::Upsert,
+            }],
+            file_path: Some(path.display().to_string()),
+            expected_version: None,
+            reload_user_config: false,
+        })
+        .await
+        .expect("hooks upsert preserves mcp_servers");
+
+    let updated = std::fs::read_to_string(&path)?;
+    assert!(
+        updated.contains("[mcp_servers.minimax]"),
+        "minimax table missing after hooks upsert: {updated}"
+    );
+    assert!(
+        updated.contains("command = \"uvx\""),
+        "command missing after hooks upsert: {updated}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn batch_write_trust_toggle_preserves_mcp_server() -> Result<()> {
+    let tmp = tempdir().expect("tempdir");
+    let path = tmp.path().join(CONFIG_TOML_FILE);
+    let original = r#"model = "MiniMax-M3"
+
+[mcp_servers.minimax]
+command = "uvx"
+args = ["minimax-coding-plan-mcp", "-y"]
+startup_timeout_sec = 30.0
+tool_timeout_sec = 60.0
+
+[mcp_servers.minimax.env]
+MINIMAX_API_HOST = "https://api.minimax.io"
+MINIMAX_API_KEY = "sk-cp-test"
+"#;
+    std::fs::write(&path, original)?;
+
+    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+    // The TUI trust toggle sends a quoted project key path: projects."/path".trust_level
+    service
+        .batch_write(ConfigBatchWriteParams {
+            edits: vec![codex_app_server_protocol::ConfigEdit {
+                key_path: "projects.\"/work/proj\".trust_level".to_string(),
+                value: serde_json::json!("trusted"),
+                merge_strategy: MergeStrategy::Replace,
+            }],
+            file_path: Some(path.display().to_string()),
+            expected_version: None,
+            reload_user_config: false,
+        })
+        .await
+        .expect("trust toggle preserves mcp_servers");
+
+    let updated = std::fs::read_to_string(&path)?;
+    assert!(
+        updated.contains("[mcp_servers.minimax]"),
+        "minimax table missing after trust toggle: {updated}"
+    );
+    assert!(
+        updated.contains("command = \"uvx\""),
+        "command missing after trust toggle: {updated}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn apply_merge_rejects_nested_write_into_scalar_parent() {
+    // Regression guard: the parents-traversal loop must not silently overwrite a
+    // scalar/array value with an empty table when a caller attempts to set a
+    // nested key whose intermediate parent is not a table. Returning an error
+    // preserves sibling data such as `[mcp_servers.minimax]`.
+    let mut root: TomlValue = toml::from_str(
+        r#"model = "MiniMax-M3"
+
+[mcp_servers.minimax]
+command = "uvx"
+"#,
+    )
+    .expect("parse");
+
+    // Two parents so the second iteration hits the `_ =>` arm of the
+    // parents-traversal match.  "model" is a scalar, so the second step
+    // cannot reasonably replace it with an empty table.
+    let segments = vec![
+        "model".to_string(),
+        "nested".to_string(),
+        "deep".to_string(),
+    ];
+    let value = TomlValue::String("oops".to_string());
+    let err = apply_merge(&mut root, &segments, Some(&value), MergeStrategy::Replace)
+        .expect_err("writing into a scalar parent must fail");
+    let MergeError::Validation(message) = err;
+    assert!(
+        message.contains("`nested`"),
+        "error should mention the conflicting parent segment: {message}"
+    );
+
+    let mcp_servers = root
+        .get("mcp_servers")
+        .and_then(TomlValue::as_table)
+        .expect("mcp_servers table preserved");
+    let minimax = mcp_servers
+        .get("minimax")
+        .and_then(TomlValue::as_table)
+        .expect("minimax table preserved");
+    assert_eq!(
+        minimax.get("command").and_then(TomlValue::as_str),
+        Some("uvx"),
+        "minimax.command must not be clobbered by the failed merge"
+    );
+}
+
+#[tokio::test]
+async fn batch_write_with_profile_v2_overlay_preserves_mcp_server() -> Result<()> {
+    // Regression test for "Invalid configuration: invalid transport in `mcp_servers.minimax`".
+    //
+    // When the TUI is started with `-p <name>`, the active user layer is the
+    // profile-v2 overlay (e.g. `minimax-m3.config.toml`), not the base
+    // `config.toml`. The profile is meant to layer overrides on top of the
+    // base; it does not have to be a complete, valid `ConfigToml` on its
+    // own. In particular, the user's profile only sets per-tool approval
+    // overrides such as `[mcp_servers.minimax.tools.web_search]` and never
+    // re-declares the `command`/`url` from the base.
+    //
+    // Before the fix, `apply_edits` validated the *raw* user layer, so the
+    // profile overlay (which has no `command`/`url`) failed
+    // `McpServerConfig::try_from` with "invalid transport" — blocking
+    // *every* config write (trust toggle, model change, skill enable, etc.)
+    // for any user running the TUI under `-p`. The fix validates the merged
+    // effective config, which is the right place to catch transport errors
+    // because that is what the user actually experiences.
+    use codex_config::CONFIG_TOML_FILE;
+    use codex_config::LoaderOverrides;
+
+    let tmp = tempdir().expect("tempdir");
+    let codex_home = tmp.path().to_path_buf();
+
+    // Write the user's main config.toml (base layer) and the profile-v2 (overlay)
+    let base_config =
+        std::fs::read_to_string("/tmp/user_config_backup.toml").expect("read user config");
+    std::fs::write(codex_home.join(CONFIG_TOML_FILE), &base_config)?;
+
+    let profile_config =
+        std::fs::read_to_string("/home/cage/.codex/minimax-m3.config.toml").expect("read profile");
+    std::fs::write(codex_home.join("minimax-m3.config.toml"), &profile_config)?;
+
+    // Point the loader at the profile
+    let mut loader_overrides = LoaderOverrides::without_managed_config_for_tests();
+    loader_overrides.user_config_path = Some(
+        codex_utils_absolute_path::AbsolutePathBuf::resolve_path_against_base(
+            "minimax-m3.config.toml",
+            &codex_home,
+        ),
+    );
+    loader_overrides.user_config_profile = Some("minimax-m3".parse().expect("profile-v2 name"));
+
+    let service = ConfigManager::new_for_tests(
+        codex_home.clone(),
+        Vec::new(),
+        loader_overrides,
+        CloudConfigBundleLoader::default(),
+    );
+
+    // This is what the TUI does for a trust toggle
+    let result = service
+        .batch_write(codex_app_server_protocol::ConfigBatchWriteParams {
+            edits: vec![codex_app_server_protocol::ConfigEdit {
+                key_path: r#"projects."/home/cage/Desktop/Workspaces/codex-fork".trust_level"#
+                    .to_string(),
+                value: serde_json::json!("trusted"),
+                merge_strategy: MergeStrategy::Replace,
+            }],
+            file_path: None,
+            expected_version: None,
+            reload_user_config: true,
+        })
+        .await;
+
+    eprintln!("RESULT: {result:#?}");
+    assert!(
+        result.is_ok(),
+        "trust toggle must succeed even when the active user layer is a profile-v2 overlay whose mcp_servers only carry tool overrides; got {result:#?}"
+    );
+    Ok(())
+}

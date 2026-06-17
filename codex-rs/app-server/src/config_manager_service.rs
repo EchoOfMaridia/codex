@@ -287,14 +287,58 @@ impl ConfigManager {
             parsed_segments.push(segments);
         }
 
-        validate_config(&user_config).map_err(|err| {
+        // Validate the *effective* (merged) config rather than the raw user layer.
+        // When a profile-v2 config is active (e.g. `-p minimax-m3` loads
+        // `minimax-m3.config.toml` on top of `config.toml`), the user layer is just
+        // the profile overlay and is not a complete, valid `ConfigToml` on its own;
+        // e.g. it may set `mcp_servers.minimax.tools.*` without re-declaring the
+        // `command`/`url` from the base. Validating the effective config after the
+        // merge still surfaces real errors, but does not reject a perfectly valid
+        // profile overlay for being incomplete.
+        let updated_layers = layers.with_user_config(&provided_path, user_config.clone());
+        let effective = updated_layers.effective_config();
+        validate_config(&effective).map_err(|err| {
             ConfigManagerError::write(
                 ConfigWriteErrorCode::ConfigValidationError,
                 format!("Invalid configuration: {err}"),
             )
         })?;
-        let user_config_toml =
-            deserialize_config_toml_with_base(user_config.clone(), self.codex_home()).map_err(
+
+        // For the non-profile case, also validate the raw user layer so we catch
+        // invalid user-written values (e.g. `approval_policy = "bogus"`) even when a
+        // managed layer happens to override the offending value in the effective
+        // config. The user layer on disk is what the user actually wrote; we want
+        // to surface errors against that, not just the merged view.
+        let user_layer_is_profile_v2 = matches!(
+            &user_layer.name,
+            ConfigLayerSource::User {
+                profile: Some(_),
+                ..
+            }
+        );
+        if !user_layer_is_profile_v2 {
+            let user_config_toml =
+                deserialize_config_toml_with_base(user_config.clone(), self.codex_home()).map_err(
+                    |err| {
+                        ConfigManagerError::write(
+                            ConfigWriteErrorCode::ConfigValidationError,
+                            format!("Invalid configuration: {err}"),
+                        )
+                    },
+                )?;
+            validate_feature_requirements_for_config_toml(
+                &user_config_toml,
+                layers.requirements().feature_requirements.as_ref(),
+            )
+            .map_err(|err| {
+                ConfigManagerError::write(
+                    ConfigWriteErrorCode::ConfigValidationError,
+                    format!("Invalid configuration: {err}"),
+                )
+            })?;
+        }
+        let effective_toml =
+            deserialize_config_toml_with_base(effective.clone(), self.codex_home()).map_err(
                 |err| {
                     ConfigManagerError::write(
                         ConfigWriteErrorCode::ConfigValidationError,
@@ -303,18 +347,10 @@ impl ConfigManager {
                 },
             )?;
         validate_feature_requirements_for_config_toml(
-            &user_config_toml,
+            &effective_toml,
             layers.requirements().feature_requirements.as_ref(),
         )
         .map_err(|err| {
-            ConfigManagerError::write(
-                ConfigWriteErrorCode::ConfigValidationError,
-                format!("Invalid configuration: {err}"),
-            )
-        })?;
-        let updated_layers = layers.with_user_config(&provided_path, user_config.clone());
-        let effective = updated_layers.effective_config();
-        validate_config(&effective).map_err(|err| {
             ConfigManagerError::write(
                 ConfigWriteErrorCode::ConfigValidationError,
                 format!("Invalid configuration: {err}"),
@@ -493,12 +529,9 @@ fn apply_merge(
                     .or_insert_with(|| TomlValue::Table(toml::map::Map::new()));
             }
             _ => {
-                *current = TomlValue::Table(toml::map::Map::new());
-                if let TomlValue::Table(table) = current {
-                    current = table
-                        .entry(segment.clone())
-                        .or_insert_with(|| TomlValue::Table(toml::map::Map::new()));
-                }
+                return Err(MergeError::Validation(format!(
+                    "cannot set value on non-table parent at `{segment}`"
+                )));
             }
         }
     }
