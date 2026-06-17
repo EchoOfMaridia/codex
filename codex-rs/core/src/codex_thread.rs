@@ -565,6 +565,10 @@ impl CodexThread {
         self.codex.session.multi_agent_version()
     }
 
+    pub async fn effective_multi_agent_mode(&self) -> Option<MultiAgentMode> {
+        self.codex.session.effective_multi_agent_mode().await
+    }
+
     /// Refresh the thread's layer-backed user config state from a caller-supplied
     /// config snapshot. Thread-scoped layers and session-static settings remain
     /// unchanged.

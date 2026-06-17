@@ -159,6 +159,7 @@ async fn thread_settings_update(
 }
 
 async fn thread_settings_applied_event(sess: &Session) -> EventMsg {
+    let multi_agent_mode = sess.effective_multi_agent_mode().await;
     let snapshot = {
         let state = sess.state.lock().await;
         state.session_configuration.thread_config_snapshot()
@@ -178,6 +179,7 @@ async fn thread_settings_applied_event(sess: &Session) -> EventMsg {
             reasoning_summary: snapshot.reasoning_summary,
             personality: snapshot.personality,
             collaboration_mode: snapshot.collaboration_mode,
+            multi_agent_mode,
         },
     })
 }

@@ -237,8 +237,10 @@ pub(super) async fn ensure_listener_task_running(
             &environments,
         )
         .await;
-    let thread_settings_baseline =
-        thread_settings_from_config_snapshot(&conversation.config_snapshot().await);
+    let thread_settings_baseline = thread_settings_from_config_snapshot(
+        &conversation.config_snapshot().await,
+        conversation.effective_multi_agent_mode().await,
+    );
     let (mut listener_command_rx, listener_generation) = {
         let mut thread_state = thread_state.lock().await;
         if thread_state.listener_matches(&conversation) {
@@ -627,6 +629,7 @@ pub(super) async fn handle_pending_thread_resume_request(
         }
     }
 
+    let multi_agent_mode = conversation.effective_multi_agent_mode().await;
     let config_snapshot = pending.config_snapshot;
     let cwd = config_snapshot.cwd().clone();
     let ThreadConfigSnapshot {
@@ -661,6 +664,7 @@ pub(super) async fn handle_pending_thread_resume_request(
         sandbox,
         active_permission_profile,
         reasoning_effort,
+        multi_agent_mode,
         initial_turns_page,
     };
     outgoing.send_response(request_id, response).await;
