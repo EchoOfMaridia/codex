@@ -8,6 +8,7 @@ use codex_plugin::PluginIdError;
 use codex_protocol::protocol::Product;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::Deserialize;
+use serde_json::Map as JsonMap;
 use serde_json::Value as JsonValue;
 use std::fs;
 use std::io;
@@ -29,6 +30,7 @@ pub struct ResolvedMarketplacePlugin {
     pub policy: MarketplacePluginPolicy,
     pub interface: Option<PluginManifestInterface>,
     pub manifest: Option<crate::manifest::PluginManifest>,
+    pub manifest_fallback: MarketplacePluginManifestFallback,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +56,34 @@ pub struct MarketplaceListOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarketplaceInterface {
     pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarketplacePluginManifestFallback {
+    contents: String,
+    has_metadata: bool,
+}
+
+impl MarketplacePluginManifestFallback {
+    pub fn contents(&self) -> &str {
+        &self.contents
+    }
+
+    pub(crate) fn contents_if_has_metadata(&self) -> Option<&str> {
+        self.has_metadata.then_some(self.contents())
+    }
+
+    pub(crate) fn parse_for_plugin_root(
+        &self,
+        plugin_root: &Path,
+    ) -> Option<crate::manifest::PluginManifest> {
+        crate::manifest::parse_plugin_manifest(
+            plugin_root,
+            &fallback_plugin_manifest_path(plugin_root),
+            &self.contents,
+        )
+        .ok()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -434,13 +464,24 @@ fn resolve_marketplace_plugin_entry(
         source,
         policy,
         category,
+        manifest_fields,
     } = plugin;
     let Some(source) = resolve_supported_plugin_source(marketplace_path, &name, source) else {
         return Ok(None);
     };
+    let manifest_fallback =
+        marketplace_plugin_manifest_fallback(&name, category.as_deref(), &manifest_fields);
 
     let manifest = match &source {
-        MarketplacePluginSource::Local { path } => load_plugin_manifest(path.as_path()),
+        MarketplacePluginSource::Local { path } => {
+            if codex_utils_plugins::find_plugin_manifest_path(path.as_path()).is_some() {
+                load_plugin_manifest(path.as_path())
+            } else if manifest_fallback.has_metadata {
+                manifest_fallback.parse_for_plugin_root(path.as_path())
+            } else {
+                None
+            }
+        }
         MarketplacePluginSource::Git { .. } => None,
     };
     let interface = plugin_interface_with_marketplace_category(
@@ -462,6 +503,7 @@ fn resolve_marketplace_plugin_entry(
         },
         interface,
         manifest,
+        manifest_fallback,
     }))
 }
 
@@ -759,6 +801,9 @@ struct RawMarketplaceManifestPlugin {
     policy: RawMarketplaceManifestPluginPolicy,
     #[serde(default)]
     category: Option<String>,
+    #[serde(default)]
+    #[serde(flatten)]
+    manifest_fields: JsonMap<String, JsonValue>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -813,6 +858,251 @@ fn resolve_marketplace_interface(
         })
     } else {
         None
+    }
+}
+
+fn fallback_plugin_manifest_path(plugin_root: &Path) -> PathBuf {
+    plugin_root.join(".codex-plugin/plugin.json")
+}
+
+fn marketplace_plugin_manifest_fallback(
+    name: &str,
+    category: Option<&str>,
+    manifest_fields: &JsonMap<String, JsonValue>,
+) -> MarketplacePluginManifestFallback {
+    let mut manifest = JsonMap::new();
+    manifest.insert("name".to_string(), JsonValue::String(name.to_string()));
+
+    let mut has_metadata = false;
+    has_metadata |= copy_string_field(&mut manifest, manifest_fields, "version");
+    has_metadata |= copy_string_field(&mut manifest, manifest_fields, "description");
+    has_metadata |= copy_string_array_field(&mut manifest, manifest_fields, "keywords");
+    has_metadata |= copy_manifest_path_field(&mut manifest, manifest_fields, "skills");
+    has_metadata |= copy_mcp_servers_field(&mut manifest, manifest_fields);
+    has_metadata |= copy_string_field(&mut manifest, manifest_fields, "apps");
+    has_metadata |= copy_hooks_field(&mut manifest, manifest_fields);
+    if let Some(interface) = plugin_manifest_interface(manifest_fields, category) {
+        manifest.insert("interface".to_string(), interface);
+        has_metadata = true;
+    }
+
+    let contents = serde_json::to_string_pretty(&JsonValue::Object(manifest))
+        .unwrap_or_else(|_| format!(r#"{{"name":"{name}"}}"#));
+    MarketplacePluginManifestFallback {
+        contents,
+        has_metadata,
+    }
+}
+
+fn copy_string_field(
+    manifest: &mut JsonMap<String, JsonValue>,
+    fields: &JsonMap<String, JsonValue>,
+    field: &'static str,
+) -> bool {
+    let Some(value) = fields.get(field).and_then(JsonValue::as_str) else {
+        return false;
+    };
+    manifest.insert(field.to_string(), JsonValue::String(value.to_string()));
+    true
+}
+
+fn copy_string_array_field(
+    manifest: &mut JsonMap<String, JsonValue>,
+    fields: &JsonMap<String, JsonValue>,
+    field: &'static str,
+) -> bool {
+    let Some(values) = string_array_value(fields.get(field)) else {
+        return false;
+    };
+    manifest.insert(field.to_string(), values);
+    true
+}
+
+fn copy_manifest_path_field(
+    manifest: &mut JsonMap<String, JsonValue>,
+    fields: &JsonMap<String, JsonValue>,
+    field: &'static str,
+) -> bool {
+    let Some(path) = manifest_path_value(fields.get(field)) else {
+        return false;
+    };
+    manifest.insert(field.to_string(), JsonValue::String(path));
+    true
+}
+
+fn copy_mcp_servers_field(
+    manifest: &mut JsonMap<String, JsonValue>,
+    fields: &JsonMap<String, JsonValue>,
+) -> bool {
+    let Some(value) = fields.get("mcpServers") else {
+        return false;
+    };
+    if value.is_string() || value.is_object() {
+        manifest.insert("mcpServers".to_string(), value.clone());
+        true
+    } else {
+        false
+    }
+}
+
+fn copy_hooks_field(
+    manifest: &mut JsonMap<String, JsonValue>,
+    fields: &JsonMap<String, JsonValue>,
+) -> bool {
+    let Some(value) = fields.get("hooks") else {
+        return false;
+    };
+    if value.is_string()
+        || value.is_object()
+        || value
+            .as_array()
+            .is_some_and(|values| values.iter().all(serde_json::Value::is_string))
+        || value
+            .as_array()
+            .is_some_and(|values| values.iter().all(serde_json::Value::is_object))
+    {
+        manifest.insert("hooks".to_string(), value.clone());
+        true
+    } else {
+        false
+    }
+}
+
+fn plugin_manifest_interface(
+    fields: &JsonMap<String, JsonValue>,
+    category: Option<&str>,
+) -> Option<JsonValue> {
+    let mut interface = JsonMap::new();
+    copy_plugin_manifest_interface_fields(&mut interface, fields);
+    if let Some(raw_interface) = fields.get("interface").and_then(JsonValue::as_object) {
+        copy_plugin_manifest_interface_fields(&mut interface, raw_interface);
+    }
+
+    if !interface.contains_key("developerName")
+        && let Some(author_name) = fields
+            .get("author")
+            .and_then(|author| author.get("name"))
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    {
+        interface.insert(
+            "developerName".to_string(),
+            JsonValue::String(author_name.to_string()),
+        );
+    }
+    if let Some(category) = category.map(str::trim).filter(|value| !value.is_empty()) {
+        interface.insert(
+            "category".to_string(),
+            JsonValue::String(category.to_string()),
+        );
+    }
+
+    (!interface.is_empty()).then_some(JsonValue::Object(interface))
+}
+
+fn copy_plugin_manifest_interface_fields(
+    interface: &mut JsonMap<String, JsonValue>,
+    fields: &JsonMap<String, JsonValue>,
+) -> bool {
+    let mut copied = false;
+    for field in [
+        "displayName",
+        "shortDescription",
+        "longDescription",
+        "developerName",
+        "category",
+        "brandColor",
+        "composerIcon",
+        "logo",
+    ] {
+        copied |= copy_string_field(interface, fields, field);
+    }
+    copied |= copy_string_field_from_aliases(
+        interface,
+        fields,
+        "websiteUrl",
+        &["websiteUrl", "websiteURL"],
+    );
+    copied |= copy_string_field_from_aliases(
+        interface,
+        fields,
+        "privacyPolicyUrl",
+        &["privacyPolicyUrl", "privacyPolicyURL"],
+    );
+    copied |= copy_string_field_from_aliases(
+        interface,
+        fields,
+        "termsOfServiceUrl",
+        &["termsOfServiceUrl", "termsOfServiceURL"],
+    );
+    copied |= copy_string_array_field(interface, fields, "capabilities");
+    copied |= copy_string_array_field(interface, fields, "screenshots");
+    copied |= copy_default_prompt_field(interface, fields);
+    copied
+}
+
+fn copy_string_field_from_aliases(
+    manifest: &mut JsonMap<String, JsonValue>,
+    fields: &JsonMap<String, JsonValue>,
+    output_field: &'static str,
+    input_fields: &[&'static str],
+) -> bool {
+    let Some(value) = input_fields
+        .iter()
+        .find_map(|field| fields.get(*field).and_then(JsonValue::as_str))
+    else {
+        return false;
+    };
+    manifest.insert(
+        output_field.to_string(),
+        JsonValue::String(value.to_string()),
+    );
+    true
+}
+
+fn copy_default_prompt_field(
+    interface: &mut JsonMap<String, JsonValue>,
+    raw_interface: &JsonMap<String, JsonValue>,
+) -> bool {
+    let Some(default_prompt) = raw_interface.get("defaultPrompt") else {
+        return false;
+    };
+    if default_prompt.is_string() {
+        interface.insert("defaultPrompt".to_string(), default_prompt.clone());
+        return true;
+    }
+    if let Some(value) = string_array_value(Some(default_prompt)) {
+        interface.insert("defaultPrompt".to_string(), value);
+        true
+    } else {
+        false
+    }
+}
+
+fn string_array_value(value: Option<&JsonValue>) -> Option<JsonValue> {
+    let values = value?.as_array()?;
+    let strings = values
+        .iter()
+        .map(JsonValue::as_str)
+        .collect::<Option<Vec<_>>>()?;
+    Some(JsonValue::Array(
+        strings
+            .into_iter()
+            .map(|value| JsonValue::String(value.to_string()))
+            .collect(),
+    ))
+}
+
+fn manifest_path_value(value: Option<&JsonValue>) -> Option<String> {
+    match value? {
+        JsonValue::String(path) => Some(path.to_string()),
+        JsonValue::Array(paths) => paths
+            .iter()
+            .filter_map(JsonValue::as_str)
+            .find(|path| !path.trim().is_empty())
+            .map(str::to_string),
+        JsonValue::Null | JsonValue::Bool(_) | JsonValue::Number(_) | JsonValue::Object(_) => None,
     }
 }
 

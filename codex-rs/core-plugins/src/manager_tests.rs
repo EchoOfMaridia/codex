@@ -2132,6 +2132,84 @@ async fn install_plugin_uses_manifest_version_for_non_curated_plugins() {
 }
 
 #[tokio::test]
+async fn install_plugin_writes_marketplace_manifest_fallback_when_missing_plugin_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_root = tmp.path().join("repo");
+    let plugin_root = repo_root.join("plugins/quality-review");
+    fs::create_dir_all(repo_root.join(".git")).unwrap();
+    fs::create_dir_all(repo_root.join(".agents/plugins")).unwrap();
+    fs::create_dir_all(plugin_root.join("skills/thermo-nuclear-code-quality-review")).unwrap();
+    fs::write(
+        plugin_root.join("skills/thermo-nuclear-code-quality-review/SKILL.md"),
+        "review skill",
+    )
+    .unwrap();
+    fs::write(
+        repo_root.join(".agents/plugins/marketplace.json"),
+        r#"{
+  "name": "debug",
+  "plugins": [
+    {
+      "name": "quality-review",
+      "description": "Strict code quality review focused on maintainability.",
+      "source": "./plugins/quality-review",
+      "author": {
+        "name": "Byron Grogan"
+      },
+      "skills": [
+        "./skills/thermo-nuclear-code-quality-review"
+      ],
+      "category": "code-review"
+    }
+  ]
+}"#,
+    )
+    .unwrap();
+
+    let result = PluginsManager::new(tmp.path().to_path_buf())
+        .install_plugin(PluginInstallRequest {
+            plugin_name: "quality-review".to_string(),
+            marketplace_path: AbsolutePathBuf::try_from(
+                repo_root.join(".agents/plugins/marketplace.json"),
+            )
+            .unwrap(),
+        })
+        .await
+        .unwrap();
+
+    let installed_path = tmp.path().join("plugins/cache/debug/quality-review/local");
+    assert_eq!(
+        result,
+        PluginInstallOutcome {
+            plugin_id: PluginId::new("quality-review".to_string(), "debug".to_string()).unwrap(),
+            plugin_version: "local".to_string(),
+            installed_path: AbsolutePathBuf::try_from(installed_path.clone()).unwrap(),
+            auth_policy: MarketplacePluginAuthPolicy::OnInstall,
+        }
+    );
+    assert!(!plugin_root.join(".codex-plugin/plugin.json").exists());
+
+    let manifest = crate::manifest::load_plugin_manifest(&installed_path).unwrap();
+    assert_eq!(manifest.name, "quality-review");
+    assert_eq!(
+        manifest.description.as_deref(),
+        Some("Strict code quality review focused on maintainability.")
+    );
+    assert_eq!(
+        manifest.paths.skills,
+        Some(
+            AbsolutePathBuf::try_from(
+                installed_path.join("skills/thermo-nuclear-code-quality-review")
+            )
+            .unwrap()
+        )
+    );
+    let interface = manifest.interface.expect("fallback interface");
+    assert_eq!(interface.developer_name.as_deref(), Some("Byron Grogan"));
+    assert_eq!(interface.category.as_deref(), Some("code-review"));
+}
+
+#[tokio::test]
 async fn install_plugin_supports_git_subdir_marketplace_sources() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_root = tmp.path().join("marketplace");

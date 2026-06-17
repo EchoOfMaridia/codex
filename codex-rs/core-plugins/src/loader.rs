@@ -6,11 +6,13 @@ use crate::manifest::PluginManifestMcpServers;
 use crate::manifest::PluginManifestPaths;
 use crate::manifest::load_plugin_manifest;
 use crate::marketplace::MarketplacePluginSource;
+use crate::marketplace::find_marketplace_plugin;
 use crate::marketplace::list_marketplaces;
 use crate::marketplace::load_marketplace;
 use crate::remote::REMOTE_GLOBAL_MARKETPLACE_NAME;
 use crate::remote::RemoteInstalledPlugin;
 use crate::store::PluginStore;
+use crate::store::copy_dir_recursive;
 use crate::store::plugin_version_for_source;
 use codex_app_server_protocol::AuthMode;
 use codex_config::ConfigLayerStack;
@@ -459,7 +461,7 @@ fn refresh_non_curated_plugin_cache_with_mode(
     let store = PluginStore::try_new(codex_home.to_path_buf()).map_err(|err| err.to_string())?;
     let marketplace_outcome = list_marketplaces(additional_roots)
         .map_err(|err| format!("failed to discover marketplaces for cache refresh: {err}"))?;
-    let mut plugin_sources = HashMap::<String, MarketplacePluginSource>::new();
+    let mut plugin_sources = HashMap::<String, (MarketplacePluginSource, Option<String>)>::new();
 
     for marketplace in marketplace_outcome.marketplaces {
         if is_openai_curated_marketplace_name(&marketplace.name) {
@@ -488,14 +490,31 @@ fn refresh_non_curated_plugin_cache_with_mode(
                 continue;
             }
 
-            plugin_sources.insert(plugin_key, plugin.source);
+            let manifest_fallback = find_marketplace_plugin(&marketplace.path, &plugin.name)
+                .map(|resolved| {
+                    resolved
+                        .manifest_fallback
+                        .contents_if_has_metadata()
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|err| {
+                    warn!(
+                        plugin = plugin.name,
+                        marketplace = marketplace.name,
+                        error = %err,
+                        "failed to resolve marketplace plugin manifest fallback during cache refresh"
+                    );
+                    None
+                });
+            plugin_sources.insert(plugin_key, (plugin.source, manifest_fallback));
         }
     }
 
     let mut cache_refreshed = false;
     for plugin_id in configured_non_curated_plugin_ids {
         let plugin_key = plugin_id.as_key();
-        let Some(source) = plugin_sources.get(&plugin_key).cloned() else {
+        let Some((source, manifest_fallback_contents)) = plugin_sources.get(&plugin_key).cloned()
+        else {
             warn!(
                 plugin = plugin_id.plugin_name,
                 marketplace = plugin_id.marketplace_name,
@@ -507,7 +526,15 @@ fn refresh_non_curated_plugin_cache_with_mode(
             materialize_marketplace_plugin_source(codex_home, &source).map_err(|err| {
                 format!("failed to materialize plugin source for {plugin_key}: {err}")
             })?;
-        let source_path = materialized.path.clone();
+        let prepared = prepare_marketplace_plugin_source_for_install(
+            codex_home,
+            &materialized.path,
+            manifest_fallback_contents.as_deref(),
+        )
+        .map_err(|err| {
+            format!("failed to prepare plugin source for cache refresh for {plugin_key}: {err}")
+        })?;
+        let source_path = prepared.path.clone();
         let plugin_version = plugin_version_for_source(source_path.as_path())
             .map_err(|err| format!("failed to read plugin version for {plugin_key}: {err}"))?;
 
@@ -1277,6 +1304,65 @@ struct PluginMcpDiscovery {
 pub struct MaterializedMarketplacePluginSource {
     pub path: AbsolutePathBuf,
     _tempdir: Option<TempDir>,
+}
+
+#[derive(Debug)]
+pub struct PreparedMarketplacePluginInstallSource {
+    pub path: AbsolutePathBuf,
+    _tempdir: Option<TempDir>,
+}
+
+pub fn prepare_marketplace_plugin_source_for_install(
+    codex_home: &Path,
+    source_path: &AbsolutePathBuf,
+    manifest_fallback_contents: Option<&str>,
+) -> Result<PreparedMarketplacePluginInstallSource, String> {
+    if find_plugin_manifest_path(source_path.as_path()).is_some()
+        || manifest_fallback_contents.is_none()
+    {
+        return Ok(PreparedMarketplacePluginInstallSource {
+            path: source_path.clone(),
+            _tempdir: None,
+        });
+    }
+
+    let staging_root = codex_home.join("plugins/.marketplace-plugin-source-staging");
+    fs::create_dir_all(&staging_root).map_err(|err| {
+        format!(
+            "failed to create marketplace plugin install staging directory {}: {err}",
+            staging_root.display()
+        )
+    })?;
+    let tempdir = tempfile::Builder::new()
+        .prefix("marketplace-plugin-install-")
+        .tempdir_in(&staging_root)
+        .map_err(|err| {
+            format!(
+                "failed to create marketplace plugin install staging directory in {}: {err}",
+                staging_root.display()
+            )
+        })?;
+    let staged_source = tempdir.path().join("source");
+    copy_dir_recursive(source_path.as_path(), &staged_source)
+        .map_err(|err| format!("failed to stage plugin source for install: {err}"))?;
+    let manifest_path = staged_source.join(".codex-plugin/plugin.json");
+    let manifest_parent = manifest_path
+        .parent()
+        .ok_or_else(|| "plugin manifest path has no parent".to_string())?;
+    fs::create_dir_all(manifest_parent)
+        .map_err(|err| format!("failed to create fallback plugin manifest directory: {err}"))?;
+    fs::write(
+        &manifest_path,
+        manifest_fallback_contents.unwrap_or_default(),
+    )
+    .map_err(|err| format!("failed to write fallback plugin manifest: {err}"))?;
+    let path = AbsolutePathBuf::try_from(staged_source)
+        .map_err(|err| format!("failed to resolve staged plugin source path: {err}"))?;
+
+    Ok(PreparedMarketplacePluginInstallSource {
+        path,
+        _tempdir: Some(tempdir),
+    })
 }
 
 pub fn materialize_marketplace_plugin_source(

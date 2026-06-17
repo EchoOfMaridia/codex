@@ -16,6 +16,7 @@ use crate::loader::load_plugins_from_layer_stack;
 use crate::loader::log_plugin_load_errors;
 use crate::loader::materialize_marketplace_plugin_source;
 use crate::loader::plugin_telemetry_metadata_from_root;
+use crate::loader::prepare_marketplace_plugin_source_for_install;
 use crate::loader::refresh_curated_plugin_cache;
 use crate::loader::refresh_non_curated_plugin_cache;
 use crate::loader::refresh_non_curated_plugin_cache_force_reinstall;
@@ -27,6 +28,7 @@ use crate::marketplace::MarketplaceInterface;
 use crate::marketplace::MarketplaceListError;
 use crate::marketplace::MarketplaceListOutcome;
 use crate::marketplace::MarketplacePluginAuthPolicy;
+use crate::marketplace::MarketplacePluginManifestFallback;
 use crate::marketplace::MarketplacePluginPolicy;
 use crate::marketplace::MarketplacePluginSource;
 use crate::marketplace::ResolvedMarketplacePlugin;
@@ -1227,11 +1229,21 @@ impl PluginsManager {
             };
         let store = self.store.clone();
         let codex_home = self.codex_home.clone();
+        let manifest_fallback_contents = resolved
+            .manifest_fallback
+            .contents_if_has_metadata()
+            .map(str::to_string);
         let result: StorePluginInstallResult = tokio::task::spawn_blocking(move || {
             let materialized =
                 materialize_marketplace_plugin_source(codex_home.as_path(), &resolved.source)
                     .map_err(PluginStoreError::Invalid)?;
-            let source_path = materialized.path;
+            let prepared = prepare_marketplace_plugin_source_for_install(
+                codex_home.as_path(),
+                &materialized.path,
+                manifest_fallback_contents.as_deref(),
+            )
+            .map_err(PluginStoreError::Invalid)?;
+            let source_path = prepared.path;
             if let Some(plugin_version) = plugin_version {
                 store.install_with_version(source_path, resolved.plugin_id, plugin_version)
             } else {
@@ -1449,6 +1461,10 @@ impl PluginsManager {
 
         let marketplace_name = plugin.plugin_id.marketplace_name.clone();
         let plugin_key = plugin.plugin_id.as_key();
+        let manifest_fallback = plugin
+            .manifest_fallback
+            .contents_if_has_metadata()
+            .map(|_| plugin.manifest_fallback.clone());
         let (installed_plugins, enabled_plugins) = self.configured_plugin_states(config);
         let installed = installed_plugins.contains(&plugin_key);
         let installed_version = if installed {
@@ -1457,7 +1473,7 @@ impl PluginsManager {
             None
         };
         let plugin = self
-            .read_plugin_detail_for_marketplace_plugin(
+            .read_plugin_detail_for_marketplace_plugin_with_fallback(
                 config,
                 &marketplace_name,
                 ConfiguredMarketplacePlugin {
@@ -1479,6 +1495,7 @@ impl PluginsManager {
                     installed,
                     enabled: enabled_plugins.contains(&plugin_key),
                 },
+                manifest_fallback,
             )
             .await?;
 
@@ -1495,6 +1512,22 @@ impl PluginsManager {
         config: &PluginsConfigInput,
         marketplace_name: &str,
         plugin: ConfiguredMarketplacePlugin,
+    ) -> Result<PluginDetail, MarketplaceError> {
+        self.read_plugin_detail_for_marketplace_plugin_with_fallback(
+            config,
+            marketplace_name,
+            plugin,
+            /*manifest_fallback*/ None,
+        )
+        .await
+    }
+
+    async fn read_plugin_detail_for_marketplace_plugin_with_fallback(
+        &self,
+        config: &PluginsConfigInput,
+        marketplace_name: &str,
+        plugin: ConfiguredMarketplacePlugin,
+        manifest_fallback: Option<MarketplacePluginManifestFallback>,
     ) -> Result<PluginDetail, MarketplaceError> {
         if !self.restriction_product_matches(plugin.policy.products.as_deref()) {
             return Err(MarketplaceError::PluginNotFound {
@@ -1562,9 +1595,15 @@ impl PluginsManager {
                 "path does not exist or is not a directory".to_string(),
             ));
         }
-        let manifest = load_plugin_manifest(source_path.as_path()).ok_or_else(|| {
-            MarketplaceError::InvalidPlugin("missing or invalid plugin.json".to_string())
-        })?;
+        let manifest = load_plugin_manifest(source_path.as_path())
+            .or_else(|| {
+                manifest_fallback
+                    .as_ref()
+                    .and_then(|fallback| fallback.parse_for_plugin_root(source_path.as_path()))
+            })
+            .ok_or_else(|| {
+                MarketplaceError::InvalidPlugin("missing or invalid plugin.json".to_string())
+            })?;
         let description = manifest.description.clone();
         let marketplace_category = plugin
             .interface

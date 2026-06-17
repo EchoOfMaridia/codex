@@ -379,7 +379,7 @@ fn compare_plugin_versions(left: &str, right: &str) -> Ordering {
     }
 }
 
-fn copy_dir_recursive(source: &Path, target: &Path) -> Result<(), PluginStoreError> {
+pub(crate) fn copy_dir_recursive(source: &Path, target: &Path) -> Result<(), PluginStoreError> {
     fs::create_dir_all(target)
         .map_err(|err| PluginStoreError::io("failed to create plugin target directory", err))?;
 

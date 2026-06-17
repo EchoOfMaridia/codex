@@ -20,6 +20,17 @@ fn write_alternate_plugin_manifest(plugin_root: &Path, contents: &str) {
     fs::write(manifest_path, contents).unwrap();
 }
 
+fn minimal_manifest_fallback(name: &str) -> MarketplacePluginManifestFallback {
+    MarketplacePluginManifestFallback {
+        contents: format!(
+            r#"{{
+  "name": "{name}"
+}}"#
+        ),
+        has_metadata: false,
+    }
+}
+
 #[test]
 fn find_marketplace_plugin_finds_repo_marketplace_plugin() {
     let tmp = tempdir().unwrap();
@@ -65,6 +76,7 @@ fn find_marketplace_plugin_finds_repo_marketplace_plugin() {
             },
             interface: None,
             manifest: None,
+            manifest_fallback: minimal_manifest_fallback("local-plugin"),
         }
     );
 }
@@ -108,6 +120,7 @@ fn find_marketplace_plugin_supports_alternate_layout_and_string_local_source() {
             },
             interface: None,
             manifest: None,
+            manifest_fallback: minimal_manifest_fallback("string-source-plugin"),
         }
     );
 }
@@ -162,8 +175,172 @@ fn find_marketplace_plugin_supports_git_subdir_sources() {
             },
             interface: None,
             manifest: None,
+            manifest_fallback: minimal_manifest_fallback("remote-plugin"),
         }
     );
+}
+
+#[test]
+fn find_marketplace_plugin_builds_manifest_fallback_from_entry() {
+    let tmp = tempdir().unwrap();
+    let repo_root = tmp.path().join("repo");
+    let plugin_root = repo_root.join("plugins/quality-review");
+    fs::create_dir_all(repo_root.join(".git")).unwrap();
+    fs::create_dir_all(repo_root.join(".agents/plugins")).unwrap();
+    fs::create_dir_all(plugin_root.join("skills/thermo-nuclear-code-quality-review")).unwrap();
+    fs::write(
+        repo_root.join(".agents/plugins/marketplace.json"),
+        r##"{
+  "name": "team-marketplace",
+  "plugins": [
+    {
+      "name": "quality-review",
+      "version": "1.2.3",
+      "description": "Strict code quality review focused on maintainability.",
+      "source": "./plugins/quality-review",
+      "author": {
+        "name": "Byron Grogan"
+      },
+      "skills": [
+        "./skills/thermo-nuclear-code-quality-review"
+      ],
+      "mcpServers": {
+        "review": {
+          "type": "stdio",
+          "command": "review-mcp"
+        }
+      },
+      "apps": "./apps/app.json",
+      "hooks": ["./hooks/session.json"],
+      "agents": [
+        "./agents/thermo-nuclear-code-quality-review.md"
+      ],
+      "category": "code-review",
+      "keywords": ["quality", "review"],
+      "shortDescription": "Top-level short description.",
+      "websiteURL": "https://example.com/quality",
+      "interface": {
+        "displayName": "Quality Review",
+        "longDescription": "Runs strict reviews focused on maintainability and boundaries.",
+        "category": "interface-category",
+        "capabilities": ["review", "quality"],
+        "privacyPolicyURL": "https://example.com/privacy",
+        "termsOfServiceUrl": "https://example.com/terms",
+        "defaultPrompt": [
+          "Review this change",
+          "Find structural issues"
+        ],
+        "brandColor": "#00AAFF",
+        "composerIcon": "./assets/icon.svg",
+        "logo": "./assets/logo.png",
+        "screenshots": ["./assets/shot.png"]
+      }
+    }
+  ]
+}"##,
+    )
+    .unwrap();
+
+    let resolved = find_marketplace_plugin(
+        &AbsolutePathBuf::try_from(repo_root.join(".agents/plugins/marketplace.json")).unwrap(),
+        "quality-review",
+    )
+    .unwrap();
+
+    let manifest = resolved.manifest.as_ref().expect("fallback manifest");
+    assert_eq!(manifest.name, "quality-review");
+    assert_eq!(manifest.version.as_deref(), Some("1.2.3"));
+    assert_eq!(
+        manifest.description.as_deref(),
+        Some("Strict code quality review focused on maintainability.")
+    );
+    assert_eq!(
+        manifest.paths.skills,
+        Some(
+            AbsolutePathBuf::try_from(
+                plugin_root.join("skills/thermo-nuclear-code-quality-review")
+            )
+            .unwrap()
+        )
+    );
+    let Some(crate::manifest::PluginManifestMcpServers::Object(mcp_servers)) =
+        manifest.paths.mcp_servers.as_ref()
+    else {
+        panic!("fallback mcpServers should be inline");
+    };
+    assert_eq!(
+        serde_json::from_str::<JsonValue>(mcp_servers).unwrap(),
+        serde_json::json!({
+            "review": {
+                "type": "stdio",
+                "command": "review-mcp"
+            }
+        })
+    );
+    assert_eq!(
+        manifest.paths.apps.as_ref(),
+        Some(&AbsolutePathBuf::try_from(plugin_root.join("apps/app.json")).unwrap())
+    );
+    assert_eq!(
+        manifest.paths.hooks.as_ref(),
+        Some(&crate::manifest::PluginManifestHooks::Paths(vec![
+            AbsolutePathBuf::try_from(plugin_root.join("hooks/session.json")).unwrap()
+        ]))
+    );
+    assert_eq!(manifest.keywords, vec!["quality", "review"]);
+    let interface = manifest.interface.as_ref().expect("fallback interface");
+    assert_eq!(
+        interface,
+        &PluginManifestInterface {
+            display_name: Some("Quality Review".to_string()),
+            short_description: Some("Top-level short description.".to_string()),
+            long_description: Some(
+                "Runs strict reviews focused on maintainability and boundaries.".to_string()
+            ),
+            developer_name: Some("Byron Grogan".to_string()),
+            category: Some("code-review".to_string()),
+            capabilities: vec!["review".to_string(), "quality".to_string()],
+            website_url: Some("https://example.com/quality".to_string()),
+            privacy_policy_url: Some("https://example.com/privacy".to_string()),
+            terms_of_service_url: Some("https://example.com/terms".to_string()),
+            default_prompt: Some(vec![
+                "Review this change".to_string(),
+                "Find structural issues".to_string()
+            ]),
+            brand_color: Some("#00AAFF".to_string()),
+            composer_icon: Some(
+                AbsolutePathBuf::try_from(plugin_root.join("assets/icon.svg")).unwrap()
+            ),
+            logo: Some(AbsolutePathBuf::try_from(plugin_root.join("assets/logo.png")).unwrap()),
+            screenshots: vec![
+                AbsolutePathBuf::try_from(plugin_root.join("assets/shot.png")).unwrap()
+            ],
+        }
+    );
+
+    let fallback_json: JsonValue =
+        serde_json::from_str(resolved.manifest_fallback.contents()).unwrap();
+    assert_eq!(
+        fallback_json["skills"],
+        JsonValue::String("./skills/thermo-nuclear-code-quality-review".to_string())
+    );
+    assert_eq!(
+        fallback_json["mcpServers"],
+        serde_json::json!({
+            "review": {
+                "type": "stdio",
+                "command": "review-mcp"
+            }
+        })
+    );
+    assert_eq!(
+        fallback_json["interface"]["websiteUrl"],
+        JsonValue::String("https://example.com/quality".to_string())
+    );
+    assert!(fallback_json["interface"].get("websiteURL").is_none());
+    assert!(fallback_json.get("author").is_none());
+    assert!(fallback_json.get("agents").is_none());
+    assert!(resolved.manifest_fallback.has_metadata);
 }
 
 #[test]
