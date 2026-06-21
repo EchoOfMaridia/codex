@@ -59,6 +59,12 @@ impl ToolCallRuntime {
         self.router.create_diff_consumer(tool_name)
     }
 
+    /// Access the underlying ToolRouter. Used by the response-item handler
+    /// in stream_events_utils to resolve wire names via the registry.
+    pub(crate) fn router(&self) -> &ToolRouter {
+        &self.router
+    }
+
     #[instrument(level = "trace", skip_all)]
     pub(crate) fn handle_tool_call(
         self,

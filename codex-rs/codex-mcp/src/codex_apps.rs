@@ -412,10 +412,8 @@ mod tests {
 
     #[test]
     fn normalize_namespace_uses_double_underscore_separator() {
-        let result = normalize_codex_apps_callable_namespace(
-            CODEX_APPS_MCP_SERVER_NAME,
-            Some("GitHub"),
-        );
+        let result =
+            normalize_codex_apps_callable_namespace(CODEX_APPS_MCP_SERVER_NAME, Some("GitHub"));
         assert_eq!(result, "codex_apps__github");
     }
 

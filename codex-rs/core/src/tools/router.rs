@@ -60,6 +60,15 @@ impl ToolRouter {
         self.model_visible_specs.clone()
     }
 
+    /// Access the underlying tool registry. Used by callers that need to
+    /// resolve a wire-name string (the identifier the model returns
+    /// verbatim) to a registered ToolName without going through the
+    /// lossy split_responses_tool_name parse. See
+    /// ToolRouter::build_tool_call.
+    pub(crate) fn registry(&self) -> &ToolRegistry {
+        &self.registry
+    }
+
     #[cfg(test)]
     pub(crate) fn registered_tool_names_for_test(&self) -> Vec<ToolName> {
         self.registry.tool_names_for_test()
@@ -92,8 +101,19 @@ impl ToolRouter {
             .unwrap_or(false)
     }
 
+    /// Convert a `ResponseItem` from the model into a `ToolCall` ready for
+    /// dispatch. The `registry` is consulted first to resolve the wire
+    /// name returned by the model to the exact `ToolName` that was
+    /// registered, so tool names containing `__` (e.g. AWS-MCP's
+    /// `aws___<name>` pattern) dispatch correctly. The lossy
+    /// `split_responses_tool_name` parser is kept as a fallback for tools
+    /// that are not in the registry (e.g. dynamic tools the model has
+    /// been told about but that have not been registered yet).
     #[instrument(level = "trace", skip_all, err)]
-    pub fn build_tool_call(item: ResponseItem) -> Result<Option<ToolCall>, FunctionCallError> {
+    pub fn build_tool_call(
+        registry: &ToolRegistry,
+        item: ResponseItem,
+    ) -> Result<Option<ToolCall>, FunctionCallError> {
         match item {
             ResponseItem::FunctionCall {
                 name,
@@ -114,7 +134,9 @@ impl ToolRouter {
                 // Amazon Bedrock, which pass the namespace through
                 // out-of-band on the function call.
                 let tool_name = if namespace.is_none() {
-                    crate::tools::split_responses_tool_name(&name)
+                    registry
+                        .resolve_wire_name(&name)
+                        .or_else(|| crate::tools::split_responses_tool_name(&name))
                         .unwrap_or_else(|| ToolName::new(namespace, name))
                 } else {
                     ToolName::new(namespace, name)

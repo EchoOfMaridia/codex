@@ -10315,7 +10315,7 @@ async fn fatal_tool_error_stops_turn_and_reports_error() {
         input: "{}".to_string(),
     };
 
-    let call = ToolRouter::build_tool_call(item.clone())
+    let call = ToolRouter::build_tool_call(router.registry(), item.clone())
         .expect("build tool call")
         .expect("tool call present");
     let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
@@ -10928,8 +10928,11 @@ while :; do sleep 1; done"#,
         .to_string(),
         call_id: "shell-cleanup-call".to_string(),
     };
-    let call = ToolRouter::build_tool_call(item)?
-        .expect("shell command response item should build a tool call");
+    let call = ToolRouter::build_tool_call(
+        &crate::tools::registry::ToolRegistry::empty_for_test(),
+        item,
+    )?
+    .expect("shell command response item should build a tool call");
     let cancellation_token = CancellationToken::new();
     let cancellation_tx = cancellation_token.clone();
     let handle = tokio::spawn(

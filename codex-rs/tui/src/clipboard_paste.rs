@@ -241,26 +241,37 @@ fn try_wayland_clipboard_fallback(
             let mut cursor = std::io::Cursor::new(&mut out);
             if let Err(enc_err) = img.write_to(&mut cursor, image::ImageFormat::Png) {
                 tracing::warn!("wl-paste: re-encode to PNG failed: {enc_err}");
-                (bytes, PastedImageInfo {
-                    width: 0,
-                    height: 0,
-                    encoded_format: EncodedImageFormat::Other,
-                })
+                (
+                    bytes,
+                    PastedImageInfo {
+                        width: 0,
+                        height: 0,
+                        encoded_format: EncodedImageFormat::Other,
+                    },
+                )
             } else {
-                (out, PastedImageInfo {
-                    width: img.width(),
-                    height: img.height(),
-                    encoded_format: EncodedImageFormat::Png,
-                })
+                (
+                    out,
+                    PastedImageInfo {
+                        width: img.width(),
+                        height: img.height(),
+                        encoded_format: EncodedImageFormat::Png,
+                    },
+                )
             }
         }
         Err(decode_err) => {
-            tracing::warn!("wl-paste: image decode failed ({decode_err}), passing raw bytes through");
-            (bytes, PastedImageInfo {
-                width: 0,
-                height: 0,
-                encoded_format: EncodedImageFormat::Other,
-            })
+            tracing::warn!(
+                "wl-paste: image decode failed ({decode_err}), passing raw bytes through"
+            );
+            (
+                bytes,
+                PastedImageInfo {
+                    width: 0,
+                    height: 0,
+                    encoded_format: EncodedImageFormat::Other,
+                },
+            )
         }
     };
 
@@ -269,8 +280,7 @@ fn try_wayland_clipboard_fallback(
         .suffix(".png")
         .tempfile()
         .map_err(|e| PasteImageError::IoError(e.to_string()))?;
-    std::fs::write(tmp.path(), &png_bytes)
-        .map_err(|e| PasteImageError::IoError(e.to_string()))?;
+    std::fs::write(tmp.path(), &png_bytes).map_err(|e| PasteImageError::IoError(e.to_string()))?;
     let (_file, path) = tmp
         .keep()
         .map_err(|e| PasteImageError::IoError(e.error.to_string()))?;
@@ -707,7 +717,6 @@ mod pasted_paths_tests {
     }
 }
 
-
 #[cfg(all(test, target_os = "linux"))]
 mod wayland_fallback_tests {
     use super::*;
@@ -729,7 +738,9 @@ mod wayland_fallback_tests {
         // Restore the env before any assertion so a failing assertion does
         // not pollute the environment for subsequent tests.
         if let Some(v) = prev {
-            unsafe { std::env::set_var("WAYLAND_DISPLAY", v); }
+            unsafe {
+                std::env::set_var("WAYLAND_DISPLAY", v);
+            }
         }
 
         // Either the call returned the original error (env was unset at
@@ -740,7 +751,10 @@ mod wayland_fallback_tests {
         match result {
             Err(PasteImageError::NoImage(msg)) => assert_eq!(msg, "test"),
             Ok((path, _info)) => {
-                assert!(path.exists(), "wl-paste fallback returned a path that does not exist");
+                assert!(
+                    path.exists(),
+                    "wl-paste fallback returned a path that does not exist"
+                );
             }
             Err(other) => panic!("unexpected error variant: {other:?}"),
         }
@@ -823,13 +837,19 @@ mod wayland_fallback_tests {
         // downstream broke. Only ClipboardUnavailable / NoImage are valid
         // triggers for the wl-paste retry.
         let prev = std::env::var_os("WAYLAND_DISPLAY");
-        unsafe { std::env::set_var("WAYLAND_DISPLAY", "wayland-0"); }
+        unsafe {
+            std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
+        }
         let original = PasteImageError::EncodeFailed("test".into());
         let result = try_wayland_clipboard_fallback(&original);
         if let Some(v) = prev {
-            unsafe { std::env::set_var("WAYLAND_DISPLAY", v); }
+            unsafe {
+                std::env::set_var("WAYLAND_DISPLAY", v);
+            }
         } else {
-            unsafe { std::env::remove_var("WAYLAND_DISPLAY"); }
+            unsafe {
+                std::env::remove_var("WAYLAND_DISPLAY");
+            }
         }
         assert!(matches!(result, Err(PasteImageError::EncodeFailed(_))));
     }

@@ -158,7 +158,10 @@ fn reasoning_effort_preset(effort: ReasoningEffort) -> ReasoningEffortPreset {
         ReasoningEffort::Custom(_) => "Model-specific reasoning effort",
     }
     .to_string();
-    ReasoningEffortPreset { effort, description }
+    ReasoningEffortPreset {
+        effort,
+        description,
+    }
 }
 
 #[cfg(test)]
@@ -245,8 +248,17 @@ mod tests {
             .collect();
         assert_eq!(highspeed_models.len(), 3);
         let priorities: Vec<i32> = highspeed_models.iter().map(|m| m.priority).collect();
-        assert!(priorities.contains(&1), "M3-highspeed should be priority 1, got {priorities:?}");
-        assert!(priorities.contains(&3), "M2.7-highspeed should be priority 3, got {priorities:?}");
-        assert!(priorities.contains(&5), "M2.5-highspeed should be priority 5, got {priorities:?}");
+        assert!(
+            priorities.contains(&1),
+            "M3-highspeed should be priority 1, got {priorities:?}"
+        );
+        assert!(
+            priorities.contains(&3),
+            "M2.7-highspeed should be priority 3, got {priorities:?}"
+        );
+        assert!(
+            priorities.contains(&5),
+            "M2.5-highspeed should be priority 5, got {priorities:?}"
+        );
     }
 }

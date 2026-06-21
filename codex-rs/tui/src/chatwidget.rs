@@ -2040,11 +2040,7 @@ fn fallback_reasoning_header(s: &str) -> Option<String> {
         }
     }
     let out = out.trim().to_string();
-    if out.len() < 3 {
-        None
-    } else {
-        Some(out)
-    }
+    if out.len() < 3 { None } else { Some(out) }
 }
 
 // Extract the first bold (Markdown) element in the form **...** from `s`.

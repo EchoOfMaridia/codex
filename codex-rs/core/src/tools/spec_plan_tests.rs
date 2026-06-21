@@ -1424,11 +1424,7 @@ async fn minimax_provider_flattens_mcp_namespaces_into_function_tools() {
             use_minimax_provider(turn);
         },
         ToolPlanInputs {
-            mcp_tools: Some(vec![mcp_tool(
-                "minimax",
-                "mcp__minimax",
-                "web_search",
-            )]),
+            mcp_tools: Some(vec![mcp_tool("minimax", "mcp__minimax", "web_search")]),
             ..ToolPlanInputs::default()
         },
     )
@@ -1448,11 +1444,9 @@ async fn minimax_provider_flattens_mcp_namespaces_into_function_tools() {
     // (ToolName's Display impl concatenates namespace+name with no separator,
     // so the local string is `mcp__minimaxweb_search`; the wire name above
     // is what actually goes out to the API.)
-    probe.assert_registered_contains(&[&ToolName::namespaced(
-        "mcp__minimax",
-        "web_search",
-    )
-    .to_string()]);
+    probe.assert_registered_contains(&[
+        &ToolName::namespaced("mcp__minimax", "web_search").to_string()
+    ]);
 }
 
 #[tokio::test]
@@ -1468,11 +1462,7 @@ async fn bedrock_provider_keeps_namespace_shape_unchanged() {
             use_bedrock_provider(turn);
         },
         ToolPlanInputs {
-            deferred_mcp_tools: Some(vec![mcp_tool(
-                "searchable",
-                "mcp__searchable",
-                "lookup",
-            )]),
+            deferred_mcp_tools: Some(vec![mcp_tool("searchable", "mcp__searchable", "lookup")]),
             ..ToolPlanInputs::default()
         },
     )

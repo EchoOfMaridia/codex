@@ -17,8 +17,8 @@ pub(crate) mod tool_dispatch_trace;
 
 use std::borrow::Cow;
 
-use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::ToolName;
+use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::formatted_truncate_text;
 use codex_utils_output_truncation::truncate_text;
@@ -82,7 +82,10 @@ pub(crate) fn split_responses_tool_name(wire_name: &str) -> Option<ToolName> {
     if namespace.is_empty() || name.is_empty() {
         return None;
     }
-    Some(ToolName::namespaced(namespace.to_string(), name.to_string()))
+    Some(ToolName::namespaced(
+        namespace.to_string(),
+        name.to_string(),
+    ))
 }
 pub(crate) fn tool_user_shell_type(
     user_shell: &crate::shell::Shell,
@@ -147,3 +150,7 @@ fn build_content_with_timeout(exec_output: &ExecToolCallOutput) -> String {
         exec_output.aggregated_output.text.clone()
     }
 }
+
+#[cfg(test)]
+#[path = "mod_tests.rs"]
+mod tests;

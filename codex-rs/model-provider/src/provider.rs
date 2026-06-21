@@ -440,7 +440,8 @@ mod tests {
         // we exercise the observable side effect: the default catalog exposed
         // by the provider's models_manager must include `MiniMax-M3` with
         // `Image` input modality.
-        let manager = provider.models_manager(test_codex_home(), /*config_model_catalog*/ None);
+        let manager =
+            provider.models_manager(test_codex_home(), /*config_model_catalog*/ None);
         let catalog = manager
             .try_list_models()
             .expect("minimax provider should expose a non-empty model list");

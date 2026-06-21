@@ -282,7 +282,6 @@ pub(crate) fn tool_suggest_enabled(turn_context: &TurnContext) -> bool {
         && features.enabled(Feature::Plugins)
 }
 
-
 /// Flattens OpenAI-only `ToolSpec::Namespace` entries into individual
 /// `ToolSpec::Function` entries when the active provider cannot pass the
 /// Responses-API namespace tool shape through to the model.

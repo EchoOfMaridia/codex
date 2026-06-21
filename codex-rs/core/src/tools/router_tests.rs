@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::config::Config;
 use crate::session::tests::make_session_and_context;
 use crate::tools::context::ToolPayload;
+use crate::tools::registry::ToolRegistry;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionRegistry;
@@ -29,6 +30,9 @@ use super::ToolCallSource;
 use super::ToolRouter;
 use super::ToolRouterParams;
 use super::extension_tool_executors;
+use crate::function_tool::FunctionCallError;
+use crate::tools::context::ToolInvocation;
+use crate::tools::registry::CoreToolRuntime;
 
 struct ExtensionEchoContributor;
 
@@ -147,13 +151,16 @@ async fn parallel_support_does_not_match_namespaced_local_tool_names() -> anyhow
 async fn build_tool_call_uses_namespace_for_registry_name() -> anyhow::Result<()> {
     let tool_name = "create_event".to_string();
 
-    let call = ToolRouter::build_tool_call(ResponseItem::FunctionCall {
-        id: None,
-        name: tool_name.clone(),
-        namespace: Some("mcp__codex_apps__calendar".to_string()),
-        arguments: "{}".to_string(),
-        call_id: "call-namespace".to_string(),
-    })?
+    let call = ToolRouter::build_tool_call(
+        &ToolRegistry::empty_for_test(),
+        ResponseItem::FunctionCall {
+            id: None,
+            name: tool_name.clone(),
+            namespace: Some("mcp__codex_apps__calendar".to_string()),
+            arguments: "{}".to_string(),
+            call_id: "call-namespace".to_string(),
+        },
+    )?
     .expect("function_call should produce a tool call");
 
     assert_eq!(
@@ -358,13 +365,16 @@ async fn extension_tool_executors_are_model_visible_and_dispatchable() -> anyhow
         "expected extension-provided tool to be visible to the model"
     );
 
-    let call = ToolRouter::build_tool_call(ResponseItem::FunctionCall {
-        id: None,
-        name: "echo".to_string(),
-        namespace: Some("extension/".to_string()),
-        arguments: json!({ "message": "hello" }).to_string(),
-        call_id: "call-extension".to_string(),
-    })?
+    let call = ToolRouter::build_tool_call(
+        router.registry(),
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "echo".to_string(),
+            namespace: Some("extension/".to_string()),
+            arguments: json!({ "message": "hello" }).to_string(),
+            call_id: "call-extension".to_string(),
+        },
+    )?
     .expect("function_call should produce a tool call");
     let result = router
         .dispatch_tool_call_with_code_mode_result(
@@ -424,3 +434,125 @@ fn namespace_function_names(specs: &[ToolSpec], namespace_name: &str) -> Vec<Str
         })
         .unwrap_or_default()
 }
+
+// --- End-to-end AWS-MCP dispatch tests --------------------------------------
+//
+// These pin the fix at the router level: `build_tool_call` must resolve the
+// wire name `mcp__aws_mcp__aws___search_documentation` to the registered
+// `ToolName { namespace: "mcp__aws_mcp", name: "aws___search_documentation" }`
+// using the registry's wire-name index, not the lossy
+// `split_responses_tool_name` parser.
+
+#[tokio::test]
+async fn build_tool_call_uses_registry_for_aws_style_wire_name() -> anyhow::Result<()> {
+    // Register a single AWS-MCP-style tool directly into the registry,
+    // bypassing `from_turn_context` so we control exactly what's in there.
+    let tool_name = ToolName::namespaced("mcp__aws_mcp", "aws___search_documentation");
+    let registry = ToolRegistry::with_handler_for_test(Arc::new(LocalTestHandler {
+        tool_name: tool_name.clone(),
+    }));
+    let router = ToolRouter::from_parts(registry, Vec::new());
+
+    let call = ToolRouter::build_tool_call(
+        router.registry(),
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "mcp__aws_mcp__aws___search_documentation".to_string(),
+            namespace: None,
+            arguments: "{}".to_string(),
+            call_id: "call-aws".to_string(),
+        },
+    )?
+    .expect("function_call should produce a tool call");
+
+    assert_eq!(
+        call.tool_name, tool_name,
+        "router must resolve the AWS-MCP wire name to the registered ToolName",
+    );
+    assert_eq!(call.call_id, "call-aws");
+    Ok(())
+}
+
+#[tokio::test]
+async fn build_tool_call_falls_back_to_split_when_not_in_registry() -> anyhow::Result<()> {
+    // With an empty registry, the lossy `split_responses_tool_name` is the
+    // only path. For names that don't contain internal `__` it still
+    // produces a sensible ToolName; the dispatch later fails because the
+    // tool isn't registered, but the ToolCall itself is well-formed.
+    let router = ToolRouter::from_parts(ToolRegistry::empty_for_test(), Vec::new());
+    let call = ToolRouter::build_tool_call(
+        router.registry(),
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "mcp__minimax__web_search".to_string(),
+            namespace: None,
+            arguments: "{}".to_string(),
+            call_id: "call-minimax".to_string(),
+        },
+    )?
+    .expect("function_call should produce a tool call");
+    assert_eq!(
+        call.tool_name,
+        ToolName::namespaced("mcp__minimax", "web_search"),
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn build_tool_call_prefers_namespace_field_over_wire_name() -> anyhow::Result<()> {
+    // When the provider passes the namespace out-of-band (OpenAI / Bedrock),
+    // the router must use that and ignore the wire name. This is the
+    // pre-existing behavior and must not regress.
+    let tool_name = ToolName::namespaced("mcp__codex_apps__calendar", "create_event");
+    let registry = ToolRegistry::with_handler_for_test(Arc::new(LocalTestHandler {
+        tool_name: tool_name.clone(),
+    }));
+    let router = ToolRouter::from_parts(registry, Vec::new());
+    let call = ToolRouter::build_tool_call(
+        router.registry(),
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "create_event".to_string(),
+            namespace: Some("mcp__codex_apps__calendar".to_string()),
+            arguments: "{}".to_string(),
+            call_id: "call-ns".to_string(),
+        },
+    )?
+    .expect("function_call should produce a tool call");
+    assert_eq!(call.tool_name, tool_name);
+    Ok(())
+}
+
+// Local test handler used by the AWS-MCP dispatch tests below. Mirrors the
+// `TestHandler` in `registry_tests.rs` but is defined here because that
+// struct lives in a `#[cfg(test)] mod tests` (private to its parent).
+struct LocalTestHandler {
+    tool_name: ToolName,
+}
+
+#[async_trait::async_trait]
+impl ToolExecutor<ToolInvocation> for LocalTestHandler {
+    fn tool_name(&self) -> ToolName {
+        self.tool_name.clone()
+    }
+    fn spec(&self) -> codex_tools::ToolSpec {
+        codex_tools::ToolSpec::Function(codex_tools::ResponsesApiTool {
+            name: self.tool_name.name.clone(),
+            description: "Local test tool.".to_string(),
+            strict: false,
+            defer_loading: None,
+            parameters: codex_tools::JsonSchema::default(),
+            output_schema: None,
+        })
+    }
+    async fn handle(
+        &self,
+        _invocation: ToolInvocation,
+    ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
+        Ok(Box::new(
+            crate::tools::context::FunctionToolOutput::from_text("ok".to_string(), Some(true)),
+        ))
+    }
+}
+
+impl CoreToolRuntime for LocalTestHandler {}

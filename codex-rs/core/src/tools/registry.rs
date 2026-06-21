@@ -21,6 +21,7 @@ use crate::tools::context::ToolPayload;
 use crate::tools::flat_tool_name;
 use crate::tools::handlers::multi_agents_spec::MULTI_AGENT_V1_NAMESPACE;
 use crate::tools::hook_names::HookToolName;
+use crate::tools::join_responses_tool_name;
 use crate::tools::lifecycle::notify_tool_finish;
 use crate::tools::lifecycle::notify_tool_start;
 use crate::tools::tool_dispatch_trace::ToolDispatchTrace;
@@ -325,11 +326,48 @@ impl CoreToolRuntime for ExposureOverride {
 
 pub struct ToolRegistry {
     tools: HashMap<ToolName, Arc<dyn CoreToolRuntime>>,
+    /// Reverse index: wire-name string -> registered `ToolName`. Built once at
+    /// registration time so the dispatcher can resolve a wire name (the
+    /// identifier the model returns verbatim) to the exact `ToolName` that
+    /// was registered, without going through the lossy
+    /// `rsplit_once("__")` parse in `split_responses_tool_name`. This is
+    /// what fixes the AWS-MCP `aws___<name>` dispatch bug: `join` and
+    /// `split` are no longer required to be perfect inverses, because
+    /// dispatch is keyed on the wire string, not on a (re-)parsed pair.
+    by_wire_name: HashMap<String, ToolName>,
 }
 
 impl ToolRegistry {
     fn new(tools: HashMap<ToolName, Arc<dyn CoreToolRuntime>>) -> Self {
-        Self { tools }
+        // Build the wire-name index from the registered tool names so every
+        // constructor path produces a consistent registry. This is the
+        // single point where the index is populated.
+        let mut by_wire_name = HashMap::with_capacity(tools.len());
+        for name in tools.keys() {
+            let wire_name = join_responses_tool_name(name);
+            if let Some(existing) = by_wire_name.get(&wire_name).cloned() {
+                warn!(
+                    "tool {name} collides on wire name {wire_name:?} with already-registered tool {existing}; first registration wins"
+                );
+                continue;
+            }
+            by_wire_name.insert(wire_name, name.clone());
+        }
+        Self {
+            tools,
+            by_wire_name,
+        }
+    }
+
+    /// Look up a registered `ToolName` by its wire-name string. Returns
+    /// `None` if no tool was registered under that exact wire form.
+    ///
+    /// The dispatcher calls this before falling back to the lossy
+    /// `split_responses_tool_name` parse, so registered tools with names
+    /// that contain `__` (e.g. AWS-MCP's `aws___search_documentation`)
+    /// still resolve correctly.
+    pub fn resolve_wire_name(&self, wire_name: &str) -> Option<ToolName> {
+        self.by_wire_name.get(wire_name).cloned()
     }
 
     pub(crate) fn from_tools(tools: impl IntoIterator<Item = Arc<dyn CoreToolRuntime>>) -> Self {

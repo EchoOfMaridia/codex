@@ -466,3 +466,95 @@ fn test_invocation(
         },
     }
 }
+
+// --- Tests for the wire-name index (AWS-MCP dispatch fix) -------------------
+//
+// The fix routes `build_tool_call` through `ToolRegistry::resolve_wire_name`
+// instead of the lossy `split_responses_tool_name` parser. These tests pin
+// the new index behavior at the registry level.
+
+#[test]
+fn resolve_wire_name_finds_aws_style_tool() {
+    let tool_name = codex_tools::ToolName::namespaced("mcp__aws_mcp", "aws___search_documentation");
+    let handler = Arc::new(TestHandler {
+        tool_name: tool_name.clone(),
+    });
+    let registry = ToolRegistry::with_handler_for_test(handler);
+
+    let wire = "mcp__aws_mcp__aws___search_documentation";
+    let resolved = registry
+        .resolve_wire_name(wire)
+        .expect("registered tool must resolve by wire name");
+    assert_eq!(resolved, tool_name);
+}
+
+#[test]
+fn resolve_wire_name_returns_none_for_unknown_wire_name() {
+    let tool_name = codex_tools::ToolName::namespaced("mcp__minimax", "web_search");
+    let registry = ToolRegistry::with_handler_for_test(Arc::new(TestHandler { tool_name }));
+    assert_eq!(
+        registry.resolve_wire_name("mcp__minimax__image_understand"),
+        None
+    );
+    assert_eq!(registry.resolve_wire_name("not even a wire name"), None);
+}
+
+#[test]
+fn resolve_wire_name_finds_simple_namespaced_tool() {
+    let tool_name = codex_tools::ToolName::namespaced("mcp__minimax", "web_search");
+    let registry = ToolRegistry::with_handler_for_test(Arc::new(TestHandler {
+        tool_name: tool_name.clone(),
+    }));
+    assert_eq!(
+        registry.resolve_wire_name("mcp__minimax__web_search"),
+        Some(tool_name)
+    );
+}
+
+#[test]
+fn by_wire_name_index_does_not_break_when_two_names_share_namespace() {
+    // Two tools under the same namespace with names that don't contain `__`
+    // should both resolve independently.
+    let search = codex_tools::ToolName::namespaced("mcp__minimax", "web_search");
+    let image = codex_tools::ToolName::namespaced("mcp__minimax", "image_understand");
+    let registry = ToolRegistry::from_tools([
+        Arc::new(TestHandler {
+            tool_name: search.clone(),
+        }) as Arc<dyn CoreToolRuntime>,
+        Arc::new(TestHandler {
+            tool_name: image.clone(),
+        }) as Arc<dyn CoreToolRuntime>,
+    ]);
+    assert_eq!(
+        registry.resolve_wire_name("mcp__minimax__web_search"),
+        Some(search)
+    );
+    assert_eq!(
+        registry.resolve_wire_name("mcp__minimax__image_understand"),
+        Some(image)
+    );
+}
+
+#[tokio::test]
+async fn dispatch_resolves_aws_style_tool_via_wire_name() -> anyhow::Result<()> {
+    // This is the end-to-end repro for the AWS-MCP dispatch bug: a tool
+    // registered with an internal `__` in its name must be dispatchable.
+    let tool_name = codex_tools::ToolName::namespaced("mcp__aws_mcp", "aws___search_documentation");
+    let registry = ToolRegistry::with_handler_for_test(Arc::new(TestHandler {
+        tool_name: tool_name.clone(),
+    }));
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let invocation = test_invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "call-aws",
+        tool_name.clone(),
+    );
+    let result = registry.dispatch_any(invocation).await;
+    // Avoid relying on `Debug` for `AnyToolResult`; just check the Result.
+    assert!(
+        result.is_ok(),
+        "AWS-MCP-style tool should dispatch via the registry wire-name index; dispatch failed",
+    );
+    Ok(())
+}

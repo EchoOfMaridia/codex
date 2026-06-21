@@ -145,8 +145,7 @@ mod tests {
         info.name = "minimax".to_string();
         info.base_url = Some("https://api.minimax.io/v1".to_string());
 
-        let provider =
-            MinimaxModelProvider::new(info, /*auth_manager*/ None);
+        let provider = MinimaxModelProvider::new(info, /*auth_manager*/ None);
         assert!(
             provider.auth_manager().is_none(),
             "with no auth_manager handed in, the provider should expose none"
